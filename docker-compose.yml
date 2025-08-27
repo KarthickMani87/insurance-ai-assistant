@@ -1,0 +1,81 @@
+version: "3.8"
+services:
+  backend-api:
+    build: ./backend-api
+    ports:
+      - "5000:5000"
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - S3_BUCKET=${S3_BUCKET}
+
+  ingestion-service:
+    build: ./ingestion-service
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - S3_BUCKET=${S3_BUCKET}
+    depends_on:
+      - backend-api
+      - rabbitmq
+
+  embedding-service:
+    build: ./embedding-service
+    depends_on:
+      - ingestion-service
+      - vector-db
+      - rabbitmq
+
+  rag-service:
+    build: ./rag-service
+    ports:
+      - "8000:8000"
+    depends_on:
+      - vector-db
+
+  vector-db:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_NO_GPU=1
+      - OLLAMA_HOST=http://0.0.0.0:11434
+      - MODEL_NAME=qwen2.5:3b-instruct
+      - EMBED_MODEL=mxbai-embed-large
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: always
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - |
+        set -e
+        /bin/ollama serve &
+        echo "Waiting for Ollama..."
+        until ollama list >/dev/null 2>&1; do sleep 1; done
+        echo "Pulling $$MODEL_NAME..."
+        ollama pull "$$MODEL_NAME"
+        echo "Pulling $$EMBED_MODEL..."
+        ollama pull "$$EMBED_MODEL"
+        echo "✅ Models ready."
+        wait
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"     # AMQP protocol
+      - "15672:15672"   # Management UI (http://localhost:15672)
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+
+volumes:
+  ollama:

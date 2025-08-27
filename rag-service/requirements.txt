@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+langgraph
+langchain
+langchain-community
+chromadb
+requests
+python-dotenv
+pydantic
+boto3         # if using SES for email
+
