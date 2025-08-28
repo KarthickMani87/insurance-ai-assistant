@@ -1,28 +1,32 @@
 version: "3.8"
+
 services:
   backend-api:
     build: ./backend-api
+    container_name: insurance-backend-api
+    env_file:
+      - .env    
     ports:
       - "5000:5000"
-    environment:
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION}
-      - S3_BUCKET=${S3_BUCKET}
 
   ingestion-service:
     build: ./ingestion-service
+    container_name: insurance-ingestion
+    env_file:
+      - .env    
     environment:
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION}
-      - S3_BUCKET=${S3_BUCKET}
+      - QUEUE_NAME=documents
     depends_on:
       - backend-api
       - rabbitmq
 
   embedding-service:
     build: ./embedding-service
+    container_name: insurance-embedding
+    environment:
+      - QUEUE_NAME=documents
+      - OLLAMA_URL=http://ollama:11434/api/embeddings
+      - EMBED_MODEL=mxbai-embed-large
     depends_on:
       - ingestion-service
       - vector-db
@@ -30,18 +34,22 @@ services:
 
   rag-service:
     build: ./rag-service
+    container_name: insurance-rag
     ports:
       - "8000:8000"
     depends_on:
       - vector-db
+      - ollama
 
   vector-db:
     image: chromadb/chroma:latest
+    container_name: insurance-vector-db
     ports:
       - "8001:8000"
 
   ollama:
     image: ollama/ollama:latest
+    container_name: insurance-ollama
     environment:
       - OLLAMA_NO_GPU=1
       - OLLAMA_HOST=http://0.0.0.0:11434
@@ -69,7 +77,7 @@ services:
 
   rabbitmq:
     image: rabbitmq:3-management
-    container_name: rabbitmq
+    container_name: insurance-rabbitmq
     ports:
       - "5672:5672"     # AMQP protocol
       - "15672:15672"   # Management UI (http://localhost:15672)

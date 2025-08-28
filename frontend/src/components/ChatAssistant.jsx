@@ -6,40 +6,96 @@ function ChatAssistant({ policyNumber }) {
   const [input, setInput] = useState("");
 
   const sendMessage = async () => {
-    const res = await axios.post("/query", {
-      policy_number: policyNumber,
-      query: input,
-    });
+    if (!input.trim()) return;
 
-    setMessages([...messages, { role: "user", text: input }, { role: "assistant", text: res.data.answer }]);
+    const newMsg = { role: "user", content: input };
+    setMessages((prev) => [...prev, newMsg]);
     setInput("");
+
+    try {
+      const res = await axios.post("http://localhost:8000/query", {
+        question: input,
+        policy_number: policyNumber,
+        conversation: messages.map((m) => m.content),
+      });
+
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: res.data.answer || JSON.stringify(res.data) },
+      ]);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "⚠️ Error connecting to server." },
+      ]);
+    }
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  };
+
+  const endConversation = async () => {
+    await axios.post("http://localhost:8000/summary", {
+      policy_number: policyNumber,
+      conversation: messages.map((m) => m.content),
+    });
+    alert("✅ Summary sent to backend team");
   };
 
   return (
-    <div className="mt-6 p-4 border rounded-lg bg-white">
-      <h3 className="font-semibold mb-2">💬 Ask Insurance Assistant</h3>
-      <div className="h-40 overflow-y-auto border p-2 mb-2 bg-gray-50">
+    <div className="mt-6 border p-4 rounded shadow bg-white">
+      <h2 className="font-bold mb-3 text-lg">💬 Chat Assistant</h2>
+
+      {/* Chat window */}
+      <div className="h-96 overflow-y-auto border rounded p-3 mb-3 bg-gray-50">
         {messages.map((m, i) => (
-          <p key={i} className={m.role === "user" ? "text-blue-700" : "text-green-700"}>
-            <b>{m.role}:</b> {m.text}
-          </p>
+          <div
+            key={i}
+            className={`mb-2 flex ${
+              m.role === "user" ? "justify-end" : "justify-start"
+            }`}
+          >
+            <div
+              className={`px-3 py-2 rounded-lg max-w-xs ${
+                m.role === "user"
+                  ? "bg-blue-500 text-white"
+                  : "bg-green-100 text-gray-800"
+              }`}
+            >
+              {m.content}
+            </div>
+          </div>
         ))}
       </div>
-      <input
-        className="border p-2 w-3/4 rounded mr-2"
-        value={input}
-        onChange={(e) => setInput(e.target.value)}
-        placeholder="Ask about coverage, hospitals, surgeries..."
-      />
-      <button
-        onClick={sendMessage}
-        className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
-      >
-        Send
-      </button>
+
+      {/* Input + actions */}
+      <div className="flex gap-2">
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Type your message and press Enter..."
+          className="flex-1 border px-3 py-2 rounded resize-none h-12"
+        />
+        <button
+          onClick={sendMessage}
+          className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded"
+        >
+          Send
+        </button>
+        <button
+          onClick={endConversation}
+          className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded"
+        >
+          End
+        </button>
+      </div>
     </div>
   );
 }
 
 export default ChatAssistant;
-

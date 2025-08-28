@@ -5,7 +5,18 @@ from graph_upload import upload_chain
 from graph_conversation import conversation_chain
 from services.email_service import send_summary_email
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="RAG Service")
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], #["http://localhost:5173"],  # Your React app
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Connect to Chroma
 chroma_client = HttpClient(host="vector-db", port=8000)
