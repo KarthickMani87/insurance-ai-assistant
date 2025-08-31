@@ -1,0 +1,18 @@
+
+# Core LLM/Embeddings dependencies
+transformers==4.44.2
+accelerate==0.34.2
+sentencepiece
+fastapi
+uvicorn[standard]
+
+# LangChain
+langchain
+langchain-openai
+
+# CPU-only Torch (no CUDA/MPS)
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+torchaudio==2.2.2+cpu
+-f https://download.pytorch.org/whl/torch_stable.html
+numpy<2
