@@ -3,9 +3,18 @@ uvicorn[standard]
 langgraph
 langchain
 langchain-community
-chromadb
+chromadb>=0.4.22
 requests
 python-dotenv
 pydantic
 boto3         # if using SES for email
-
+redis>=5.0.0
+sentence-transformers
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+torchaudio==2.2.2+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+langchain-huggingface
+numpy<2
+langchain-openai
+langchain-ollama

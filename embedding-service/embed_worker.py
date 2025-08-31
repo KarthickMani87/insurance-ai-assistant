@@ -1,37 +1,103 @@
 import os
-import json
-import pika
 import requests
+import json
 import time
+import pika
+import redis
 from chromadb import HttpClient
+from huggingface_hub import login
+from pydantic import BaseModel
+from langchain_openai import OpenAIEmbeddings
+from dotenv import load_dotenv
 
-# --- Env vars ---
+
+# --- Load env file (useful for local dev; in Docker, envs are already injected) ---
+load_dotenv()
+
+# --- HuggingFace auth ---
+hf_token = os.getenv("HF_TOKEN")
+if hf_token:
+    login(token=hf_token)
+
+# --- Redis ---
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+# --- RabbitMQ ---
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
+RABBITMQ_USER = os.getenv("RABBITMQ_DEFAULT_USER", "guest")
+RABBITMQ_PASS = os.getenv("RABBITMQ_DEFAULT_PASS", "guest")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "documents")
-VECTOR_DB_HOST = os.getenv("VECTOR_DB_HOST", "http://vector-db:8000")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "mxbai-embed-large")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434/api/embeddings")
 
-# --- Connect to Chroma ---
-chroma_client = HttpClient(host="vector-db", port=8000)
-collection = chroma_client.get_or_create_collection(name="documents")
+# --- Vector DB ---
+VECTOR_DB_HOST = os.getenv("VECTOR_DB_HOST", "vector-db")
+VECTOR_DB_PORT = int(os.getenv("VECTOR_DB_PORT", 8000))
+COLLECTION_NAME = os.getenv("VECTOR_COLLECTION", "insurance_docs")
 
-# --- Call Ollama embeddings ---
+chroma_client = HttpClient(host=VECTOR_DB_HOST, port=VECTOR_DB_PORT)
+collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+
+# --- Embeddings ---
+EMBED_MODEL = os.getenv("EMBED_MODEL", "mixedbread-ai/mxbai-embed-large-v1")
+EMBEDDINGS_URL = os.getenv("EMBEDDINGS_URL")
+
+print(f"🔗 Using OpenAIEmbeddings : {EMBED_MODEL}")
+
+
+# --- Metadata sanitizer ---
+def sanitize_metadata(meta: dict) -> dict:
+    clean = {}
+    for k, v in meta.items():
+        if v is None:
+            continue  # skip nulls
+        if isinstance(v, (str, int, float, bool)):
+            clean[k] = v
+        else:
+            clean[k] = str(v)  # force to string if weird type
+    return clean
+
+
+# --- Redis progress tracking ---
+def update_progress(job_id, total_chunks):
+    job_key = f"job:{job_id}"
+
+    if not r.exists(job_key):
+        print(f"⚠️ Redis job {job_key} not found — creating placeholder")
+        r.hset(job_key, mapping={
+            "status": "processing",
+            "total_chunks": total_chunks,
+            "chunks_done": 0,
+            "created_at": time.time()
+        })
+
+    new_done = r.hincrby(job_key, "chunks_done", 1)
+    r.hset(job_key, "updated_at", time.time())
+
+    total = r.hget(job_key, "total_chunks")
+    print(f"📊 Progress for {job_id}: {new_done}/{total}")
+
+    if new_done >= int(total):
+        r.hset(job_key, "status", "complete")
+        print(f"✅ Job {job_id} marked complete in Redis")
+
+# --- Call embedding model ---
 def embed_text(text: str):
-    """Call Ollama to embed text"""
-    response = requests.post(
-        OLLAMA_URL,
-        json={"model": EMBED_MODEL, "input": text}
-    )
-    response.raise_for_status()
-    data = response.json()
+    text = (text or "").strip()  # handle None and whitespace
+    if not text:
+        print("⚠️ Skipping empty text embedding")
+        # Return a zero-vector (same dimension every time) to keep downstream code happy
+        return [0.0] * 384   # <-- replace 768 with your model’s embedding size
+    
+    try:
+        payload = {"model": EMBED_MODEL, "input": text}
+        resp = requests.post(EMBEDDINGS_URL, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()["data"][0]["embedding"]
+    except Exception as e:
+        print(f"❌ Embedding failed for text: {str(text)[:50]}... | Error: {e}")
+        raise
 
-    # Handle both single and batch embedding cases
-    vector = data.get("embedding") or []
-    if not vector or len(vector) == 0:
-        raise ValueError(f"Got empty embedding from Ollama for input length={len(text)}")
-
-    return vector
 
 # --- Process each message ---
 def process_message(ch, method, properties, body):
@@ -43,26 +109,36 @@ def process_message(ch, method, properties, body):
     text = msg["text"]
 
     print(f"🧩 Embedding {filename} [chunk {chunk_id+1}/{total_chunks}]")
+    if not isinstance(text, str):
+        print("❌ text is not a string! Example value:", str(text)[:200])
 
     try:
         vector = embed_text(text)
         print(f"   → Embedding length: {len(vector)}")
 
-        doc_id = f"{key}__{chunk_id}"  # unique per chunk
+        doc_id = f"{key}__{chunk_id}"
         metadata = {
             "filename": filename,
             "key": key,
             "chunk_id": chunk_id,
             "total_chunks": total_chunks,
+            "policyholder_name": msg.get("policyholder_name"),
+            "policy_number": msg.get("policy_number"),
+            "policy_type": msg.get("policy_type"),
+            "coverage": msg.get("coverage"),
+            "start_date": msg.get("start_date"),
+            "end_date": msg.get("end_date"),
         }
 
-        # Ensure embeddings is 2D list
+        metadata = sanitize_metadata(metadata)
+
         collection.add(
             ids=[doc_id],
-            embeddings=[vector],  # wrapped in list
+            embeddings=[vector],
             documents=[text],
             metadatas=[metadata],
         )
+        update_progress(key, total_chunks)
 
         print(f"✅ Stored chunk {chunk_id+1}/{total_chunks} for {filename} in vector DB")
 
@@ -70,6 +146,7 @@ def process_message(ch, method, properties, body):
         print(f"❌ Failed embedding {filename} chunk {chunk_id}: {e}")
 
     ch.basic_ack(delivery_tag=method.delivery_tag)
+
 
 def consume():
     while True:
@@ -89,22 +166,7 @@ def consume():
             print(f"⚠️ Embedding worker error: {e}, retrying in 5s...")
             time.sleep(5)
 
-def wait_for_model():
-    import time
-    while True:
-        try:
-            r = requests.post(
-                OLLAMA_URL,
-                json={"model": EMBED_MODEL, "input": "ping"}
-            )
-            data = r.json()
-            if data.get("embedding") and len(data["embedding"]) > 0:
-                print(f"✅ Model {EMBED_MODEL} is ready with embedding size {len(data['embedding'])}")
-                return
-        except Exception as e:
-            print(f"⏳ Waiting for Ollama model {EMBED_MODEL}... {e}")
-        time.sleep(3)
 
 if __name__ == "__main__":
-    wait_for_model()
+    print(f"EMBEDDING: Starting worker with model {EMBED_MODEL}")
     consume()

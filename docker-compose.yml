@@ -1,4 +1,3 @@
-version: "3.8"
 
 services:
   backend-api:
@@ -8,6 +7,7 @@ services:
       - .env    
     ports:
       - "5000:5000"
+    image: backend-api:latest
 
   ingestion-service:
     build: ./ingestion-service
@@ -23,67 +23,73 @@ services:
   embedding-service:
     build: ./embedding-service
     container_name: insurance-embedding
+    env_file:
+      - .env
     environment:
       - QUEUE_NAME=documents
-      - OLLAMA_URL=http://ollama:11434/api/embeddings
-      - EMBED_MODEL=mxbai-embed-large
+      - VECTOR_COLLECTION=${VECTOR_COLLECTION}
+      - EMBED_MODEL=${EMBED_MODEL}
+      - HUGGINGFACE_TOKEN=${HF_TOKEN}
+      - EMBEDDINGS_URL=${EMBEDDINGS_URL}   # talk to TEI
     depends_on:
       - ingestion-service
       - vector-db
       - rabbitmq
+      - embeddings-server
+    command: python -u embed_worker.py
 
   rag-service:
     build: ./rag-service
     container_name: insurance-rag
     ports:
       - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - VECTOR_COLLECTION=${VECTOR_COLLECTION}
+      - LLM_MODEL=${LLM_MODEL}
     depends_on:
       - vector-db
-      - ollama
+    image: rag-service:latest
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface    
 
   vector-db:
     image: chromadb/chroma:latest
     container_name: insurance-vector-db
+    env_file:
+      - .env
     ports:
       - "8001:8000"
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: insurance-ollama
-    environment:
-      - OLLAMA_NO_GPU=1
-      - OLLAMA_HOST=http://0.0.0.0:11434
-      - MODEL_NAME=qwen2.5:3b-instruct
-      - EMBED_MODEL=mxbai-embed-large
-    volumes:
-      - ollama:/root/.ollama
+  embeddings-server:
+    build: ./embedding-server
+    container_name: insurance-embeddings-server
     ports:
-      - "11434:11434"
-    restart: always
-    entrypoint:
-      - /bin/sh
-      - -lc
-      - |
-        set -e
-        /bin/ollama serve &
-        echo "Waiting for Ollama..."
-        until ollama list >/dev/null 2>&1; do sleep 1; done
-        echo "Pulling $$MODEL_NAME..."
-        ollama pull "$$MODEL_NAME"
-        echo "Pulling $$EMBED_MODEL..."
-        ollama pull "$$EMBED_MODEL"
-        echo "✅ Models ready."
-        wait
+      - "8002:8000"
+    environment:
+      - EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+    env_file:
+      - .env   # this is from root
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
 
   rabbitmq:
     image: rabbitmq:3-management
     container_name: insurance-rabbitmq
+    env_file:
+      - .env
     ports:
-      - "5672:5672"     # AMQP protocol
-      - "15672:15672"   # Management UI (http://localhost:15672)
-    environment:
-      - RABBITMQ_DEFAULT_USER=guest
-      - RABBITMQ_DEFAULT_PASS=guest
+      - "5672:5672"
+      - "15672:15672"
+
+  redis:
+    image: redis:7
+    container_name: insurance-redis
+    env_file:
+      - .env
+    ports:
+      - "6379:6379"
 
 volumes:
-  ollama:
+  models:

@@ -5,3 +5,4 @@ docx2txt
 pdfplumber
 pika
 transformers
+redis>=5.0.0
