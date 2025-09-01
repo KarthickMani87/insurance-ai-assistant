@@ -10,22 +10,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from graph_upload import upload_chain
 from graph_conversation import conversation_chain
 from services.email_service import send_summary_email
-from services.llm_service import extract_policy_metadata, extract_merged_policy_data, draft_fraud_alert
+from services.llm_service import extract_policy_metadata, extract_merged_policy_data, draft_fraud_alert, return_dummy
 from utils.verify_policy import verify_policy
 from services.email_service import send_summary_email
+from utils.chroma_client import retrieve_query
+from utils.state_store import save_state, load_state
+from utils.conversation_state import ConversationStateModel
+from utils.cleanupFunc import collect_docs
 
-# --- Load env variables ---
-VECTOR_COLLECTION = os.getenv("VECTOR_COLLECTION", "insurance_docs")
-VECTOR_DB_HOST = os.getenv("VECTOR_DB_HOST", "vector-db")
-VECTOR_DB_PORT = int(os.getenv("VECTOR_DB_PORT", 8000))
 
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-
-EMBED_MODEL = os.getenv("EMBED_MODEL", "mixedbread-ai/mxbai-embed-large-v1")
-EMBEDDINGS_URL = os.getenv("EMBEDDINGS_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "none")
-KNN_SEARCH = int(os.getenv("KNN_SEARCH", 10))
+from config import (
+    VECTOR_COLLECTION,
+    REDIS_HOST, REDIS_PORT,
+)
 
 # --- FastAPI app ---
 app = FastAPI(title="RAG Service")
@@ -39,29 +36,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Connect to Chroma ---
-chroma_client = HttpClient(host=VECTOR_DB_HOST, port=VECTOR_DB_PORT)
-collection = chroma_client.get_or_create_collection(name=VECTOR_COLLECTION)
-
 # --- Redis ---
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+redis_inst = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 # --- Embeddings client (via TEI API) ---
-print(f"🔗 Using embeddings model: {EMBED_MODEL}")
+print(f"Starting RAG Service")
 
 
-def collect_docs(results: dict) -> list[str]:
-    """
-    Flatten and deduplicate documents from a Chroma query response.
-    Handles both single-query and multi-query results.
-    """
-    docs = []
-    if results and "documents" in results:
-        for doc_list in results["documents"]:   # one list per query
-            for chunk in doc_list:
-                if chunk not in docs:           # avoid duplicates
-                    docs.append(chunk)
-    return docs
 
 def chunk_text(text: str, max_chars: int = 1000):
     """
@@ -89,7 +70,7 @@ def upload_doc(data: UploadRequest):
     """Check job status + return policy metadata once ready"""
     job_id = os.path.basename(data.key)   # ✅ normalize
     job_key = f"job:{job_id}"
-    job = r.hgetall(job_key)
+    job = redis_inst.hgetall(job_key)
 
     '''
     if not job:
@@ -113,18 +94,7 @@ def upload_doc(data: UploadRequest):
 
     #query_vector = embedder.embed_query(query_text)
 
-    payload = {"model": EMBED_MODEL, "input": query_text}
-    resp = requests.post(EMBEDDINGS_URL, json=payload, timeout=30)
-    resp.raise_for_status()
-     
-    query_vector = resp.json()["data"][0]["embedding"]
-
-    results = collection.query(
-        query_embeddings=[query_vector],
-        n_results=KNN_SEARCH,
-        where_document={"$contains": "policy"},   # basic keyword filter
-        include=["documents", "metadatas", "distances"],
-    )
+    results = retrieve_query(query_text, VECTOR_COLLECTION)
 
     docs = collect_docs(results)
     document_text = "\n".join(docs)
@@ -160,15 +130,15 @@ def upload_doc(data: UploadRequest):
                 "message": "This document does not appear to be an insurance policy. Please upload a valid policy document."
             }
 
-        required_fields = [
-            "policyholder_name",
-            "policy_number",
-            "insured_person", 
-            "policy_type",
-            "coverage",
-            "start_date",
-            "end_date",
-        ]
+    required_fields = [
+        "policyholder_name",
+        "policy_number",
+        "insured_person", 
+        "policy_type",
+        "coverage",
+        "start_date",
+        "end_date",
+    ]
 
     verify_required_fields = [
         "policyholder_name",
@@ -178,14 +148,7 @@ def upload_doc(data: UploadRequest):
         "end_date",
     ]
 
-    final_extracted = {
-        "policyholder_name": "David",
-        "policy_number": "POL10005",
-        "insured_person": ["David"],
-        "policy_type": "Health Insurance",
-        "coverage": "All",
-        "start_date": "2024-09-09",
-        "end_date": "2025-09-08",}    
+    final_extracted = return_dummy()
 
     details = {field: final_extracted.get(field) for field in verify_required_fields}
 
@@ -207,15 +170,44 @@ def upload_doc(data: UploadRequest):
 
 @app.post("/query")
 def query(data: QueryRequest):
-    """Interactive Q&A"""
-    context = retrieve_policy_chunks(data.policy_number, data.question)
-    state = conversation_chain.invoke({
+    """Interactive Q&A with Multi-Agent LangGraph"""
+
+    # Load existing conversation state from Redis (or empty dict if none)
+    state = load_state(data.policy_number) or {}
+
+    # Ensure required fields exist
+    default_state = {
+        "policy_number": data.policy_number,
+        "policyholder_name": state.get("policyholder_name"),
+        "policy_type": state.get("policy_type"),
+        "start_date": data.start_date or state.get("start_date"),
+        "end_date": data.end_date or state.get("end_date"),
+        "history": state.get("history", []),
+        "fraud": state.get("fraud", False),
+    }
+
+    # Always update with latest question
+    default_state.update({
         "question": data.question,
-        "document_text": context,
-        "start_date": data.start_date,
-        "end_date": data.end_date
     })
-    return state
+
+    # --- Debug log before graph ---
+    print("=== Incoming Query ===")
+    print(f"Policy: {data.policy_number}")
+    print(f"Question: {data.question}")
+    print(f"Policy Type: {default_state.get('policy_type')}")
+    print("======================")
+
+    # Run LangGraph
+    new_state = conversation_chain.invoke(default_state)
+
+    # --- Debug log after router ---
+    print(f"[Router → {new_state.get('route', 'UNKNOWN_AGENT')}]")
+
+    # Save updated state back to Redis
+    save_state(data.policy_number, new_state)
+
+    return new_state
 
 
 @app.post("/summary")

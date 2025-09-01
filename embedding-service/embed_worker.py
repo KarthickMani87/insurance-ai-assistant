@@ -42,6 +42,8 @@ collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
 EMBED_MODEL = os.getenv("EMBED_MODEL", "mixedbread-ai/mxbai-embed-large-v1")
 EMBEDDINGS_URL = os.getenv("EMBEDDINGS_URL")
 
+MODEL_VECTOR_SIZE = int(os.getenv("EMBED_VECTOR_SIZE", "384"))
+
 print(f"🔗 Using OpenAIEmbeddings : {EMBED_MODEL}")
 
 
@@ -87,7 +89,7 @@ def embed_text(text: str):
     if not text:
         print("⚠️ Skipping empty text embedding")
         # Return a zero-vector (same dimension every time) to keep downstream code happy
-        return [0.0] * 384   # <-- replace 768 with your model’s embedding size
+        return [0.0] * MODEL_VECTOR_SIZE   # <-- replace 768 with your model’s embedding size
     
     try:
         payload = {"model": EMBED_MODEL, "input": text}

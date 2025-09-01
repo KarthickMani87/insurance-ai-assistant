@@ -1,11 +1,8 @@
-import os
-import requests
 from typing import Optional, List, Dict
+from utils.chroma_client import retrieve_get
 
-from .chroma_client import get_policy_instance
+from config import VECTOR_POLICY_SEARCH_KEY
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "mixedbread-ai/mxbai-embed-large-v1")
-EMBEDDINGS_URL = os.getenv("EMBEDDINGS_URL")
 
 def verify_policy(details: dict):
     """
@@ -15,12 +12,7 @@ def verify_policy(details: dict):
 
     errors = []
 
-    policy_client = get_policy_instance()
-
-    # Deterministic lookup by policy number (safe, no embeddings needed)
-    policy_result = policy_client.get(
-        where={"policy_number": details.get("policy_number")}
-    )
+    policy_result = retrieve_get(details.get(VECTOR_POLICY_SEARCH_KEY))
 
     if not policy_result or not policy_result.get("metadatas"):
         return False, ["❌ No policy found in database"]

@@ -21,6 +21,7 @@ app.add_middleware(
 tokenizer = None
 model = None
 
+MAX_TOKEN = int(os.getenv("MAX_TOKEN", "384"))
 
 @app.on_event("startup")
 async def load_model():
@@ -63,7 +64,7 @@ async def create_embeddings(req: EmbeddingRequest, request: Request):
         texts,
         padding=True,
         truncation=True,
-        max_length=384,
+        max_length=MAX_TOKEN,
         return_tensors="pt"
     )
 
