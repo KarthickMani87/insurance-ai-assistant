@@ -6,12 +6,9 @@ import pika
 import redis
 from chromadb import HttpClient
 from huggingface_hub import login
-from pydantic import BaseModel
-from langchain_openai import OpenAIEmbeddings
 from dotenv import load_dotenv
 
-
-# --- Load env file (useful for local dev; in Docker, envs are already injected) ---
+# --- Load env ---
 load_dotenv()
 
 # --- HuggingFace auth ---
@@ -42,25 +39,27 @@ collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
 EMBED_MODEL = os.getenv("EMBED_MODEL", "mixedbread-ai/mxbai-embed-large-v1")
 EMBEDDINGS_URL = os.getenv("EMBEDDINGS_URL")
 
-MODEL_VECTOR_SIZE = int(os.getenv("EMBED_VECTOR_SIZE", "384"))
+print(f"🔗 Using embeddings model: {EMBED_MODEL}")
 
-print(f"🔗 Using OpenAIEmbeddings : {EMBED_MODEL}")
+# --- Globals ---
+_embedding_dim_cache = None
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 32))
 
+_batch = {"ids": [], "embeddings": [], "documents": [], "metadatas": []}
 
-# --- Metadata sanitizer ---
+# --- Helpers ---
 def sanitize_metadata(meta: dict) -> dict:
     clean = {}
     for k, v in meta.items():
         if v is None:
-            continue  # skip nulls
+            continue
         if isinstance(v, (str, int, float, bool)):
             clean[k] = v
         else:
-            clean[k] = str(v)  # force to string if weird type
+            clean[k] = str(v)
     return clean
 
 
-# --- Redis progress tracking ---
 def update_progress(job_id, total_chunks):
     job_key = f"job:{job_id}"
 
@@ -83,25 +82,47 @@ def update_progress(job_id, total_chunks):
         r.hset(job_key, "status", "complete")
         print(f"✅ Job {job_id} marked complete in Redis")
 
-# --- Call embedding model ---
+
 def embed_text(text: str):
-    text = (text or "").strip()  # handle None and whitespace
+    global _embedding_dim_cache
+
+    text = (text or "").strip()
     if not text:
         print("⚠️ Skipping empty text embedding")
-        # Return a zero-vector (same dimension every time) to keep downstream code happy
-        return [0.0] * MODEL_VECTOR_SIZE   # <-- replace 768 with your model’s embedding size
-    
+        return [0.0] * (_embedding_dim_cache or 384)
+
+    payload = {"model": EMBED_MODEL, "input": text}
+    resp = requests.post(EMBEDDINGS_URL, json=payload, timeout=30)
+    resp.raise_for_status()
+
+    vector = resp.json()["data"][0]["embedding"]
+
+    # Detect embedding size once
+    if _embedding_dim_cache is None:
+        _embedding_dim_cache = len(vector)
+        print(f"📐 Detected embedding size: {_embedding_dim_cache}")
+
+    return vector
+
+
+def flush_batch():
+    if not _batch["ids"]:
+        return
     try:
-        payload = {"model": EMBED_MODEL, "input": text}
-        resp = requests.post(EMBEDDINGS_URL, json=payload, timeout=30)
-        resp.raise_for_status()
-        return resp.json()["data"][0]["embedding"]
+        collection.add(
+            ids=_batch["ids"],
+            embeddings=_batch["embeddings"],
+            documents=_batch["documents"],
+            metadatas=_batch["metadatas"],
+        )
+        print(f"✅ Flushed {len(_batch['ids'])} chunks to vector DB")
     except Exception as e:
-        print(f"❌ Embedding failed for text: {str(text)[:50]}... | Error: {e}")
-        raise
+        print(f"❌ Failed batch insert: {e}")
+    finally:
+        for k in _batch:
+            _batch[k].clear()
 
 
-# --- Process each message ---
 def process_message(ch, method, properties, body):
     msg = json.loads(body)
     key = msg["key"]
@@ -111,12 +132,9 @@ def process_message(ch, method, properties, body):
     text = msg["text"]
 
     print(f"🧩 Embedding {filename} [chunk {chunk_id+1}/{total_chunks}]")
-    if not isinstance(text, str):
-        print("❌ text is not a string! Example value:", str(text)[:200])
 
     try:
         vector = embed_text(text)
-        print(f"   → Embedding length: {len(vector)}")
 
         doc_id = f"{key}__{chunk_id}"
         metadata = {
@@ -130,19 +148,22 @@ def process_message(ch, method, properties, body):
             "coverage": msg.get("coverage"),
             "start_date": msg.get("start_date"),
             "end_date": msg.get("end_date"),
+            "section": msg.get("section", "GENERAL"),
         }
 
         metadata = sanitize_metadata(metadata)
 
-        collection.add(
-            ids=[doc_id],
-            embeddings=[vector],
-            documents=[text],
-            metadatas=[metadata],
-        )
-        update_progress(key, total_chunks)
+        # Batch insert
+        _batch["ids"].append(doc_id)
+        _batch["embeddings"].append(vector)
+        _batch["documents"].append(text)
+        _batch["metadatas"].append(metadata)
 
-        print(f"✅ Stored chunk {chunk_id+1}/{total_chunks} for {filename} in vector DB")
+        if len(_batch["ids"]) >= BATCH_SIZE:
+            flush_batch()
+
+        job_id = os.path.basename(key)
+        update_progress(job_id, total_chunks)
 
     except Exception as e:
         print(f"❌ Failed embedding {filename} chunk {chunk_id}: {e}")
@@ -154,7 +175,7 @@ def consume():
     while True:
         try:
             connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=RABBITMQ_HOST, heartbeat=600)
+                pika.ConnectionParameters(host=RABBITMQ_HOST, heartbeat=60)
             )
             channel = connection.channel()
             channel.queue_declare(queue=QUEUE_NAME, durable=True)
@@ -171,4 +192,7 @@ def consume():
 
 if __name__ == "__main__":
     print(f"EMBEDDING: Starting worker with model {EMBED_MODEL}")
-    consume()
+    try:
+        consume()
+    finally:
+        flush_batch()

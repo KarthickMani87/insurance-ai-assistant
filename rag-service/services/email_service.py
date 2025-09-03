@@ -13,7 +13,7 @@ SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 BACKEND_TEAM_EMAIL = os.getenv("BACKEND_TEAM_EMAIL")
 
-def send_summary_email(subject: str, email_content: str):
+def send_email(subject: str, email_content: str):
     msg = MIMEMultipart()
     msg["From"] = SMTP_USER
     msg["To"] = BACKEND_TEAM_EMAIL

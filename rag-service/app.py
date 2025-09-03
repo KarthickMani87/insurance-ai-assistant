@@ -1,18 +1,19 @@
 import os
 import redis
+import json
 import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
-from chromadb import HttpClient
-from langchain_openai import OpenAIEmbeddings
 from fastapi.middleware.cors import CORSMiddleware
+
+from fastapi import APIRouter
+from utils.memory_utils import HybridMemory
 
 from graph_upload import upload_chain
 from graph_conversation import conversation_chain
-from services.email_service import send_summary_email
+from services.email_service import send_email
 from services.llm_service import extract_policy_metadata, extract_merged_policy_data, draft_fraud_alert, return_dummy
-from utils.verify_policy import verify_policy
-from services.email_service import send_summary_email
+from utils.verify_policy import verify_policy, get_policy_from_db
 from utils.chroma_client import retrieve_query
 from utils.state_store import save_state, load_state
 from utils.conversation_state import ConversationStateModel
@@ -22,6 +23,7 @@ from utils.cleanupFunc import collect_docs
 from config import (
     VECTOR_COLLECTION,
     REDIS_HOST, REDIS_PORT,
+    OPENAI_MODEL,
 )
 
 # --- FastAPI app ---
@@ -35,6 +37,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # --- Redis ---
 redis_inst = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
@@ -68,13 +71,25 @@ class QueryRequest(BaseModel):
 @app.post("/upload")
 def upload_doc(data: UploadRequest):
     """Check job status + return policy metadata once ready"""
-    job_id = os.path.basename(data.key)   # ✅ normalize
+
+    # --- 1. Ensure ingestion polling is running ---
+    if not redis_inst.get("polling_started"):
+        requests.post("http://ingestion-service:9000/start-polling")
+        redis_inst.set("polling_started", "1")
+        print("⚡ Ingestion polling started")
+
+    # --- 2. Check ingestion job status ---
+    job_id = os.path.basename(data.key)
     job_key = f"job:{job_id}"
     job = redis_inst.hgetall(job_key)
 
-    '''
     if not job:
-        return {"status": "not_found", "message": "No processing job found for this file."}
+        return {
+            "status": "pending",
+            "chunks_done": 0,
+            "total_chunks": 0,
+            "message": "Processing document, please wait..."
+        }
 
     if job["status"] != "complete":
         return {
@@ -83,138 +98,153 @@ def upload_doc(data: UploadRequest):
             "total_chunks": int(job.get("total_chunks", 0)),
             "message": "Processing document, please wait..."
         }
-    
-    '''
 
-    # --- Retrieve relevant chunks semantically ---
-    query_text = (
-        "Extract policy holder name, policy number, policy type, coverage, expiry dates, Policy issuer "
-        "from this insurance policy document."
-    )
+    # --- 3. Guard: check if extraction already done ---
+    extracted_key = f"extracted:{job_id}"
+    if redis_inst.exists(extracted_key):
+        print(f"✅ Returning cached extraction for {job_id}")
+        return json.loads(redis_inst.get(extracted_key))
 
-    #query_vector = embedder.embed_query(query_text)
+    # --- 4. Run extraction once ---
+    print(f"⚡ Running extraction for {job_id}")
 
-    results = retrieve_query(query_text, VECTOR_COLLECTION)
-
-    docs = collect_docs(results)
-    document_text = "\n".join(docs)
-    #print("document text extracted:", document_text)
-
-    if False:
-        # Step 1: Chunk
-        chunk_results = []
-        for chunk in chunk_text(document_text, max_chars=2500):  # keep each chunk small
-            res = extract_policy_metadata(chunk)
-            chunk_results.append(res)
-
-        # Step 2: Merge
-        final_extracted = extract_merged_policy_data(chunk_results)
-
-
-        print("Received Final Extracted: ", final_extracted)
-
-        #print("Prtint Extracted Data: ", extracted)
-        '''
-        # --- Save extracted metadata back into Chroma ---
-        if results.get("ids"):
-            collection.update(
-                ids=results["ids"],
-                metadatas=[extracted for _ in results["ids"]]
-            )
-        '''
-
-        # --- Final check ---
-        if not final_extracted.get("policy_number"):
-            return {
-                "status": "complete",
-                "message": "This document does not appear to be an insurance policy. Please upload a valid policy document."
-            }
-
-    required_fields = [
-        "policyholder_name",
-        "policy_number",
-        "insured_person", 
-        "policy_type",
-        "coverage",
-        "start_date",
-        "end_date",
-    ]
-
-    verify_required_fields = [
-        "policyholder_name",
-        "policy_number",
-        "policy_type",
-        "start_date",
-        "end_date",
-    ]
-
-    final_extracted = return_dummy()
-
-    details = {field: final_extracted.get(field) for field in verify_required_fields}
-
-    # Call verify_policy with details
-    is_valid, messages = verify_policy(details) 
-
-    if not is_valid:
-        # 📝 Draft fraud alert with LLM (subject + body JSON)
-        fraud_email = draft_fraud_alert(details, messages)
-
-        # 📧 Send to backend team
-        send_summary_email(fraud_email["subject"], fraud_email["body"])    
-
-    return {
-        "status": "complete",
-        "message": "Insurance policy processed successfully.",
-        **{field: final_extracted.get(field) for field in required_fields},
+    fields = {
+        "policyholder_name": "Find the policyholder name (the contract owner).",
+        "insured_person": "List all insured persons or covered individuals.",
+        "policy_number": "Find the policy number.",
+        "insurance_provider": "Find the insurance company/provider.",
+        "policy_type": "Find the type of insurance policy (health, motor, life, travel, etc.).",
+        "coverage": "List the coverage benefits provided by this policy.",
+        "start_date": "Find the start date of the policy.",
+        "end_date": "Find the expiry/end date of the policy."
     }
+
+    document_texts = []
+
+    for field, query_text in fields.items():
+        results = retrieve_query(
+            query_text,
+            VECTOR_COLLECTION,
+            mode="extraction",   # 👈 deterministic metadata mode
+            top_k=3
+        )
+        docs = collect_docs(results)
+        document_texts.extend(docs)
+
+
+    # --- 5. Run extraction on retrieved chunks directly ---
+    chunk_results = []
+    for doc in document_texts:
+        res = extract_policy_metadata(doc, model=OPENAI_MODEL)
+        chunk_results.append(res)
+
+    # Merge results
+    final_extracted = extract_merged_policy_data(chunk_results, model=OPENAI_MODEL)
+    print("Received Final Extracted:", final_extracted)
+
+    if not final_extracted.get("policy_number"):
+        response = {
+            "status": "complete",
+            "message": "❌ Not a valid insurance policy document."
+        }
+        redis_inst.set(extracted_key, json.dumps(response))
+        return response
+
+    # --- 6. Verify against DB ---
+    verify_fields = ["policyholder_name", "policy_number", "insurance_provider",
+                     "policy_type", "start_date", "end_date"]
+
+    details = {f: final_extracted.get(f) for f in verify_fields}
+    policy = get_policy_from_db(details)
+
+    if not policy:
+        response = {
+            "status": "not_found",
+            "message": "❌ Policy not found in database."
+        }
+        redis_inst.set(extracted_key, json.dumps(response))
+        return response
+
+    is_valid, messages = verify_policy(details, policy)
+    if not is_valid:
+        fraud_email = draft_fraud_alert(details, messages)
+        send_email(fraud_email["subject"], fraud_email["body"])
+        response = {
+            "status": "error",
+            "message": "⚠️ We could not verify this policy. Please contact support."
+        }
+        redis_inst.set(extracted_key, json.dumps(response))
+        return response
+
+    # --- 7. Success ---
+    response = {
+        "status": "complete",
+        "message": "✅ Insurance policy verified successfully.",
+        **{f: final_extracted.get(f) for f in fields}
+    }
+    redis_inst.set(extracted_key, json.dumps(response))
+    return response
+
 
 @app.post("/query")
 def query(data: QueryRequest):
     """Interactive Q&A with Multi-Agent LangGraph"""
 
-    # Load existing conversation state from Redis (or empty dict if none)
-    state = load_state(data.policy_number) or {}
+    def normalize_state(state):
+        """Ensure LangGraph state is always a dict."""
+        if isinstance(state, list):
+            return state[0] if state else {}
+        if not isinstance(state, dict):
+            return {"answer": str(state)}
+        return state
 
-    # Ensure required fields exist
+    # --- Load state from Redis ---
+    stored_state = load_state(data.policy_number) or {}
+
+    # --- Restore or create memory ---
+    if "mem_vars" in stored_state:
+        memory = HybridMemory.deserialize(stored_state["mem_vars"])
+    else:
+        memory = HybridMemory(buffer_k=5)
+
+    stored_state["memory"] = memory
+
+    # --- Prepare state for graph ---
     default_state = {
         "policy_number": data.policy_number,
-        "policyholder_name": state.get("policyholder_name"),
-        "policy_type": state.get("policy_type"),
-        "start_date": data.start_date or state.get("start_date"),
-        "end_date": data.end_date or state.get("end_date"),
-        "history": state.get("history", []),
-        "fraud": state.get("fraud", False),
+        "policyholder_name": stored_state.get("policyholder_name"),
+        "insurance_provider": stored_state.get("insurance_provider"),
+        "policy_type": stored_state.get("policy_type"),
+        "start_date": data.start_date or stored_state.get("start_date"),
+        "end_date": data.end_date or stored_state.get("end_date"),
+        "fraud": stored_state.get("fraud", False),
+        "memory": stored_state["memory"],  # HybridMemory object
+        "question": data.question,
     }
 
-    # Always update with latest question
-    default_state.update({
-        "question": data.question,
-    })
-
-    # --- Debug log before graph ---
     print("=== Incoming Query ===")
     print(f"Policy: {data.policy_number}")
     print(f"Question: {data.question}")
-    print(f"Policy Type: {default_state.get('policy_type')}")
     print("======================")
 
-    # Run LangGraph
-    new_state = conversation_chain.invoke(default_state)
+    # --- Run LangGraph ---
+    raw_state = conversation_chain.invoke(default_state)
+    new_state = normalize_state(raw_state)
 
-    # --- Debug log after router ---
+    print("=== Graph Returned ===")
+    print(f"Answer: {new_state.get('answer')}")
     print(f"[Router → {new_state.get('route', 'UNKNOWN_AGENT')}]")
+    print("======================")
 
-    # Save updated state back to Redis
-    save_state(data.policy_number, new_state)
+    # --- Save state back to Redis ---
+    save_state(
+        data.policy_number,
+        {
+            **{k: v for k, v in new_state.items() if k not in ("memory", "mem_vars")},
+            "mem_vars": memory.serialize(),  # JSON-safe memory snapshot
+        },
+    )
 
-    return new_state
+    # --- Only return the final RAG answer ---
+    return {"answer": new_state.get("answer", "No response available.")}
 
-
-@app.post("/summary")
-def send_summary(data: QueryRequest):
-    """Send summary to backend team at end of conversation"""
-    summary = f"Policy {data.policy_number}, Conversation: {data.conversation}"
-    conclusion = "Conversation completed"
-    next_step = "Proceed with claims"  # could be refined with LLM
-    send_summary_email(data.conversation, conclusion, next_step)
-    return {"message": "Summary sent to backend team"}

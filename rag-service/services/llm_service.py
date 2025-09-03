@@ -1,40 +1,63 @@
-import json
-import re
 import os
 import requests
 from typing import Optional, List, Dict
 from pydantic import BaseModel
-
-
-from langchain_core.prompts import PromptTemplate
-from langchain.chains import LLMChain
+from langchain_openai import ChatOpenAI
 from langchain_ollama import OllamaLLM
+from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain.output_parsers import OutputFixingParser
 
 from utils.cleanupFunc import clean_value, clean_name, normalize_date
+from config import LLM_MODEL, LLM_URL, OPENAI_API_KEY, OPENAI_MODEL
 
-from config import LLM_MODEL, LLM_URL
+OPENAI_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"}
+# --- Pick correct LLM backend ---
+def pick_llm(model: str = None):
+    """
+    Return an LLM instance.
+    - "openai" → OpenAI
+    - otherwise → Ollama with given model
+    """
+    
+    chosen = (model or LLM_MODEL).lower()
 
-llm = OllamaLLM(
-    model=LLM_MODEL,
-    base_url=LLM_URL,
-    request_timeout=300,
-    options={"stream": False}
-)
-
-print(f"🚀 LLM {LLM_MODEL} at {LLM_URL}")
-
+    if chosen in OPENAI_MODELS:
+        #print("openAI Key: ", OPENAI_API_KEY, "Model: ", OPENAI_MODEL)
+        return ChatOpenAI(
+            model=OPENAI_MODEL,
+            api_key=OPENAI_API_KEY,
+            request_timeout=300
+        )
+        
+    else:
+        return OllamaLLM(
+            model=model or LLM_MODEL,
+            base_url=LLM_URL,
+            request_timeout=300,
+            options={"stream": False}
+        )
 
 def call_llm(prompt: str, model: str = None) -> str:
     """
-    Call an LLM REST API (Ollama by default).
-    - Defaults to the model set in env (mistral).
-    - Override with `model` param for per-call flexibility.
+    Call an LLM (Ollama via REST or OpenAI via LangChain).
+    - Defaults to Ollama model set in env (e.g., mistral).
+    - If model="openai", it will call OpenAI instead.
     """
 
     model_name = model or LLM_MODEL
 
+    # ---- Case 1: OpenAI ----
+    if model_name in OPENAI_MODELS:
+        try:
+            llm = pick_llm(model_name)  # reuse picker for consistency
+            resp = llm.invoke(prompt)
+            return resp.content.strip()
+        except Exception as e:
+            print(f"❌ OpenAI call failed: {e}")
+            return "⚠️ OpenAI service unavailable."
+
+    # ---- Case 2: Ollama (direct REST) ----
     payload = {
         "model": model_name,
         "prompt": prompt,
@@ -47,13 +70,14 @@ def call_llm(prompt: str, model: str = None) -> str:
         data = resp.json()
         return data.get("response", "").strip()
     except Exception as e:
-        print(f"❌ LLM call failed: {e}")
-        return "⚠️ LLM service unavailable."
+        print(f"❌ Ollama call failed: {e}")
+        return "⚠️ Ollama service unavailable."
     
 # --- Schema ---
 class PolicyMetadata(BaseModel):
     policyholder_name: Optional[str] = None
     policy_number: Optional[str] = None
+    insurance_provider: Optional[str] = None
     insured_person: Optional[List[str]] = None
     policy_type: Optional[str] = None
     coverage: Optional[List[str]] = None
@@ -61,24 +85,30 @@ class PolicyMetadata(BaseModel):
     end_date: Optional[str] = None
 
 
+# --- Dummy ---
 def return_dummy():
-    # ✅ Hard-coded mock policy metadata
     return PolicyMetadata(
-                policyholder_name="Karthick Mani",
-                policy_number="AUTH12345",
-                insured_person=["Karthick Mani"],  # optional, but included for consistency
-                policy_type="Health Recharge",
-                coverage=["Hospitalization up to INR 25,00,000 with deductible INR 5,00,000"],
-                start_date="2025-08-03",
-                end_date="2026-08-02"
-            ).dict()
+        policyholder_name="Karthick Mani",
+        policy_number="AUTH12345",
+        insurance_provider="Niva Bupa",
+        insured_person=["Karthick Mani"],
+        policy_type="Health Recharge",
+        coverage=["Hospitalization up to INR 25,00,000 with deductible INR 5,00,000"],
+        start_date="2025-08-03",
+        end_date="2026-08-02"
+    ).dict()
+
 
 # --- Helpers ---
-def _safe_normalize(result: dict) -> dict:
-    """Normalize raw parsed values."""
+def _safe_normalize(result) -> dict:
+    if isinstance(result, list):
+        # take first item or merge — depending on your use case
+        result = result[0] if result else {}
+
     return {
         "policyholder_name": clean_name(clean_value(result.get("policyholder_name"))),
         "policy_number": clean_value(result.get("policy_number")),
+        "insurance_provider": clean_value(result.get("insurance_provider")),
         "insured_person": result.get("insured_person") or [],
         "policy_type": clean_value(result.get("policy_type")),
         "coverage": result.get("coverage") or [],
@@ -88,26 +118,33 @@ def _safe_normalize(result: dict) -> dict:
 
 
 # --- Extraction ---
-def extract_policy_metadata(document: str) -> dict:
+def extract_policy_metadata(document: str, model: str = None) -> dict:
     parser = JsonOutputParser(pydantic_object=PolicyMetadata)
+    llm = pick_llm(model)
     fixing_parser = OutputFixingParser.from_llm(parser=parser, llm=llm)
 
     prompt = """
 You are an expert assistant for insurance policies.
 
 Extract the following fields from the policy text below:
-- policyholder_name
-- policy_number
-- insured_person
-- policy_type
-- coverage
-- start_date
-- end_date
+
+- policyholder_name: The main contract holder or applicant. Remove titles (Mr., Mrs., Dr., etc.).
+- insured_person: A list of all covered individuals. 
+  • In health policies: list dependents, family members, or covered persons.  
+  • In motor policies: usually the vehicle owner (often the same as policyholder).  
+  • If none are listed separately, return an empty list.
+- policy_number: The official policy number.
+- insurance_provider: The insurance company name.
+- policy_type: Type of insurance (Health, Motor/Vehicle, Life, Travel, etc.).
+- coverage: A list of coverage items explicitly mentioned (hospitalization, accident, theft, third-party liability, etc.).
+- start_date: Start date of the policy or "Period of Insurance".
+- end_date: End/expiry date of the policy or "Period of Insurance".
+- policy_issuer: The issuing office/branch/company details if listed.
 
 STRICT RULES:
 - Output ONLY valid JSON (no markdown, no code fences, no explanations, no comments).
-- Do NOT guess or assume values. If unclear, use null.
-- Dates must remain exactly as in text; do NOT invent.
+- Do NOT guess or assume values. If unclear, use null or [].
+- Dates must remain exactly as in the text (no reformatting, no invention).
 
 {format_instructions}
 
@@ -115,14 +152,21 @@ Policy text:
 {document}
 """
 
-    chain = PromptTemplate(
-        template=prompt,
-        input_variables=["document"],
-        partial_variables={"format_instructions": parser.get_format_instructions()},
-    ) | llm | fixing_parser
+    print("Documents for extraction: ", document)
+
+    chain = (
+        PromptTemplate(
+            template=prompt,
+            input_variables=["document"],
+            partial_variables={"format_instructions": parser.get_format_instructions()},
+        )
+        | llm
+        | fixing_parser
+    )
 
     try:
         raw = chain.invoke({"document": document})
+        print("RAW: ", raw)
         return _safe_normalize(raw)
     except Exception as e:
         print("❌ Metadata extraction failed:", e)
@@ -130,48 +174,45 @@ Policy text:
 
 
 # --- Merge ---
-def extract_merged_policy_data(chunk_results: List[Dict]) -> dict:
+def extract_merged_policy_data(chunk_results: List[Dict], model: str = None) -> dict:
     parser = JsonOutputParser(pydantic_object=PolicyMetadata)
+    llm = pick_llm(model)
     fixing_parser = OutputFixingParser.from_llm(parser=parser, llm=llm)
 
     merge_prompt = """
-Extract the following fields from the policy text below:
+    You are an expert assistant for insurance policies.
 
-- policyholder_name: The full name of the main policyholder. Remove titles (Mr., Ms., Mrs., Dr.).
-- policy_number: The official policy number. If not present, return null.
-- insured_person: A list of real person names covered under the policy. 
-  • Do not include placeholders like "The insured person", "Policyholder", or "Name and address...".
-  • Remove titles (Mr., Ms., Mrs., Dr.).
-  • Return [] if none are listed.
-- policy_type: Type of insurance (Health, Life, etc.), null if unclear.
-- coverage: List of coverage items (hospitalization, accident, etc.). Do not return amounts here.
-- start_date: Explicit start date as given, null if not found.
-- end_date: Explicit end date as given, null if not found.
+    Your task is to MERGE the partial extraction results into ONE final JSON object.
 
-STRICT RULES:
-- Output ONLY valid JSON (no explanations, no markdown, no comments).
-- Do not guess or assume values. If unclear, use null or [].
+    Schema:
+    {format_instructions}
 
+    Partial results:
+    {chunk_results}
 
-Schema:
-{format_instructions}
+    STRICT RULES:
+    - Output ONLY a single valid JSON object (no list, no array, no markdown, no comments).
+    - Do not guess or assume values. If unclear, use null or [].
+    """
 
-Partial results:
-{chunk_results}
-"""
-
-    chain = PromptTemplate(
-        template=merge_prompt,
-        input_variables=["chunk_results"],
-        partial_variables={"format_instructions": parser.get_format_instructions()},
-    ) | llm | fixing_parser
+    chain = (
+        PromptTemplate(
+            template=merge_prompt,
+            input_variables=["chunk_results"],
+            partial_variables={"format_instructions": parser.get_format_instructions()},
+        )
+        | llm
+        | fixing_parser
+    )
 
     try:
         raw = chain.invoke({"chunk_results": str(chunk_results)})
+        print("RAW MERGE OUTPUT:", raw)
         return _safe_normalize(raw)
     except Exception as e:
         print("❌ Merge failed:", e)
         return PolicyMetadata().dict()
+
 
 
 def draft_fraud_alert(details: dict, errors: list):
@@ -225,6 +266,7 @@ def draft_fraud_alert(details: dict, errors: list):
 
     Policy Details:
     Policy Number: {policy_number}
+    Insurance Provider: {insurance_provider}
     Policyholder Name: {policyholder_name}
     Policy Type: {policy_type}
     Start Date: {start_date}
@@ -238,6 +280,7 @@ def draft_fraud_alert(details: dict, errors: list):
         template=template,
         input_variables=[
             "policy_number",
+            "insurance_provider",
             "policyholder_name",
             "policy_type",
             "start_date",

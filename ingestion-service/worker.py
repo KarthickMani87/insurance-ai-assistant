@@ -10,6 +10,9 @@ import pika
 from dotenv import load_dotenv
 from transformers import AutoTokenizer
 from botocore.client import Config
+from fastapi import FastAPI
+import threading
+from fastapi.middleware.cors import CORSMiddleware
 
 # --- Load env variables ---
 load_dotenv()
@@ -37,7 +40,9 @@ s3_client = boto3.client(
     config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"})
 )
 
+# --- Job Tracking ---
 def create_job(job_id, filename, total_chunks):
+    print("JOB ID CREATED:", job_id)
     job = {
         "job_id": job_id,
         "filename": filename,
@@ -58,7 +63,7 @@ def connect_rabbitmq(max_retries=10, delay=5):
     for attempt in range(max_retries):
         try:
             connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host="rabbitmq", heartbeat=600)
+                pika.ConnectionParameters(host="rabbitmq", heartbeat=60)
             )
             print("✅ Connected to RabbitMQ")
             return connection
@@ -71,44 +76,57 @@ connection = connect_rabbitmq()
 channel = connection.channel()
 channel.queue_declare(queue=QUEUE_NAME, durable=True)
 
-# --- Load Tokenizer for embeddings ---
-MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+# --- Load Tokenizer ---
+MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-mpnet-base-v2")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", 384))  # MiniLM default = 384
-MIN_TOKENS = int(os.getenv("MIN_TOKENS", 5))
+
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", 450))
+MIN_TOKENS = int(os.getenv("MIN_TOKENS", 20))
+OVERLAP = int(os.getenv("OVERLAP", 60))
 
 def tokenize_length(text: str) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False))
 
-# --- Dynamic Chunking ---
+# --- Section detection ---
+SECTION_KEYWORDS = [
+    "DEFINITIONS", "EXCLUSIONS", "COVERAGE", "WAITING PERIOD",
+    "BENEFITS", "CLAIMS", "TERMS AND CONDITIONS"
+]
+
+def detect_section(line: str, current_section: str) -> str:
+    upper_line = line.strip().upper()
+    for keyword in SECTION_KEYWORDS:
+        if keyword in upper_line:
+            return keyword
+    return current_section
+
+# --- Block Detection ---
 def detect_blocks(text: str):
-    """Split into semantic blocks: paragraphs, lists, tables"""
+    """Split into semantic blocks and tag sections."""
     lines = text.split("\n")
     blocks, buffer = [], []
+    current_section = "GENERAL"
 
     def flush():
-        nonlocal buffer
+        nonlocal buffer, current_section
         if buffer:
-            blocks.append("\n".join(buffer).strip())
+            blocks.append({"text": "\n".join(buffer).strip(), "section": current_section})
             buffer = []
 
     for line in lines:
+        current_section = detect_section(line, current_section)
         line_strip = line.strip()
 
         if "|" in line_strip or "\t" in line_strip:
             flush()
-            blocks.append(line_strip)
+            blocks.append({"text": f"[TABLE START]\n{line_strip}\n[TABLE END]", "section": current_section})
             continue
 
-        if re.match(r"^(\*|-|•)\s+", line_strip):  # bullets
-            buffer.append(line_strip)
+        if re.match(r"^(\*|-|•)\s+", line_strip) or re.match(r"^\d+\.\s+", line_strip):
+            buffer.append("[LIST ITEM] " + line_strip)
             continue
 
-        if re.match(r"^\d+\.\s+", line_strip):  # numbered list
-            buffer.append(line_strip)
-            continue
-
-        if line_strip == "":  # paragraph break
+        if line_strip == "":
             flush()
         else:
             buffer.append(line_strip)
@@ -116,50 +134,56 @@ def detect_blocks(text: str):
     flush()
     return blocks
 
-def dynamic_chunk(text: str):
-    chunks = []
+# --- Chunking with Overlap ---
+def dynamic_chunk(text: str, max_tokens=MAX_TOKENS, overlap=OVERLAP):
     blocks = detect_blocks(text)
+    raw_chunks, buffer, buffer_tokens = [], [], 0
 
-    buffer, buffer_tokens = [], 0
     for block in blocks:
-        tokens = tokenize_length(block)
+        block_text = block["text"]
+        block_section = block["section"]
+        tokens = tokenizer.encode(block_text, add_special_tokens=False)
 
-        # 🚨 Block itself too long
-        if tokens > MAX_TOKENS:
-            words, sub_chunk, sub_tokens = block.split(), [], 0
+        if len(tokens) > max_tokens:
+            words, sub_chunk, sub_tokens = block_text.split(), [], 0
             for word in words:
                 word_tokens = tokenize_length(word)
-                if sub_tokens + word_tokens > MAX_TOKENS:
-                    chunks.append(" ".join(sub_chunk))
+                if sub_tokens + word_tokens > max_tokens:
+                    raw_chunks.append({"text": " ".join(sub_chunk), "section": block_section})
                     sub_chunk, sub_tokens = [word], word_tokens
                 else:
                     sub_chunk.append(word)
                     sub_tokens += word_tokens
             if sub_chunk:
-                chunks.append(" ".join(sub_chunk))
+                raw_chunks.append({"text": " ".join(sub_chunk), "section": block_section})
             continue
 
-        # Normal accumulation
-        if buffer_tokens + tokens <= MAX_TOKENS:
-            buffer.append(block)
-            buffer_tokens += tokens
+        if buffer_tokens + len(tokens) <= max_tokens:
+            buffer.append(block_text)
+            buffer_tokens += len(tokens)
         else:
-            chunks.append("\n\n".join(buffer))
-            buffer, buffer_tokens = [block], tokens
+            raw_chunks.append({"text": "\n\n".join(buffer), "section": block_section})
+            buffer, buffer_tokens = [block_text], len(tokens)
 
     if buffer:
-        chunks.append("\n\n".join(buffer))
+        raw_chunks.append({"text": "\n\n".join(buffer), "section": block_section})
 
-    # --- Final safeguard: enforce string + truncate ---
     final_chunks = []
-    for chunk in chunks:
-        if not isinstance(chunk, str):
-            chunk = " ".join(map(str, chunk))  # flatten list → string
-        tokens = tokenizer.encode(chunk, add_special_tokens=False)
-        if len(tokens) > MAX_TOKENS:
-            tokens = tokens[:MAX_TOKENS]
-            chunk = tokenizer.decode(tokens)
-        final_chunks.append(chunk)
+    for i, chunk in enumerate(raw_chunks):
+        tokens = tokenizer.encode(chunk["text"], add_special_tokens=False)
+        if len(tokens) > max_tokens:
+            tokens = tokens[:max_tokens]
+
+        if overlap > 0 and i > 0:
+            prev_tokens = tokenizer.encode(final_chunks[-1]["text"], add_special_tokens=False)
+            overlap_tokens = prev_tokens[-overlap:]
+            tokens = overlap_tokens + tokens
+            tokens = tokens[:max_tokens]
+
+        final_chunks.append({
+            "text": tokenizer.decode(tokens),
+            "section": chunk["section"]
+        })
 
     return final_chunks
 
@@ -184,26 +208,24 @@ def process_file(key: str):
     chunks = dynamic_chunk(text)
 
     job_id = os.path.basename(key)
+    create_job(job_id=job_id, filename=job_id, total_chunks=len(chunks))
+    mark_processing(job_id)
 
-    # Step 1: Create job
-    create_job(job_id=key, filename=os.path.basename(key), total_chunks=len(chunks))
-    mark_processing(key)
-
-    # Step 2: Publish chunks
     for i, chunk in enumerate(chunks):
-        if not isinstance(chunk, str):
-            chunk = str(chunk)
-
         payload = {
             "key": key,
             "filename": os.path.basename(key),
             "bucket": S3_BUCKET,
             "chunk_id": i,
             "total_chunks": len(chunks),
-            "text": chunk,   # always safe string
+            "text": chunk["text"],
+            "metadata": {
+                "policy_number": os.path.splitext(os.path.basename(key))[0],
+                "chunk_type": "table" if "[TABLE START]" in chunk["text"] else "text",
+                "section": chunk["section"]
+            }
         }
-
-        print(f"📤 Publishing chunk {i+1}/{len(chunks)} for {key}, length={len(chunk)} chars")
+        print(f"📤 Publishing chunk {i+1}/{len(chunks)} for {key}, section={chunk['section']}")
         channel.basic_publish(
             exchange="",
             routing_key=QUEUE_NAME,
@@ -232,6 +254,30 @@ def poll_s3():
                     print(f"❌ Failed to process {key}: {e}")
         time.sleep(30)
 
+# --- FastAPI App ---
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # ⚠️ Restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+polling_thread = None
+polling_enabled = False
+
+@app.post("/start-polling")
+def start_polling():
+    global polling_thread, polling_enabled
+    if not polling_enabled:
+        polling_enabled = True
+        polling_thread = threading.Thread(target=poll_s3, daemon=True)
+        polling_thread.start()
+        return {"status": "started"}
+    return {"status": "already running"}
+
 if __name__ == "__main__":
-    print("🚀 Ingestion worker started, watching S3...")
-    poll_s3()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=9000)

@@ -5,6 +5,7 @@ class ConversationStateModel(BaseModel):
     policy_number: str
     question: str
     document_text: str
+    insurance_provider: Optional[str] = None
     policyholder_name: Optional[str] = None
     policy_type: Optional[str] = None
     start_date: Optional[str] = None

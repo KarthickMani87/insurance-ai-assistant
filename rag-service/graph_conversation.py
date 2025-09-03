@@ -1,61 +1,27 @@
 from langgraph.graph import StateGraph, END
-from services.llm_service import call_llm, draft_fraud_alert
-from services.policy_api import check_policy_status
-from utils.verify_policy import verify_policy
-from services.email_service import send_summary_email
+from services.llm_service import call_llm
+from services.email_service import send_email
 from utils.chroma_client import retrieve_query
 from utils.cleanupFunc import collect_docs
+from utils.memory_utils import HybridMemory
 from config import VECTOR_COLLECTION, LLM_LIGHT_MODEL
 
 
-# --- Router Agent ---
-def router(state: dict):
-    q = state.get("question", "")
-    policy_type = state.get("policy_type", "")
-
-    prompt = f"""
-    You are a coordinator agent.
-
-    Policy type: {policy_type}
-    Question: {q}
-
-    Decide which agent should answer:
-    - HEALTH_AGENT: if health/medical/hospitalization related
-    - VEHICLE_AGENT: if vehicle/auto/accident/repair related
-    - HUMAN_AGENT: if unusual or unsupported
-    Always run FRAUD_AGENT in parallel in the background.
-
-    Respond with ONLY one of: HEALTH_AGENT, VEHICLE_AGENT, HUMAN_AGENT
-    """
-    state["route"] = call_llm(prompt, LLM_LIGHT_MODEL).strip().upper()
-    return state
+# --- Helpers ---
+def ensure_dict(state, node_name="node"):
+    if isinstance(state, dict):
+        print(f"[{node_name}] ✅ dict keys: {list(state.keys())}")
+        return state
+    print(f"[{node_name}] ❌ returned {type(state)} -> wrapping")
+    if isinstance(state, list):
+        return state[0] if state else {}
+    return {"answer": str(state)}
 
 
-# --- Fraud Agent ---
-def fraud_agent(state: dict):
-    details = {
-        "policyholder_name": state.get("policyholder_name"),
-        "policy_number": state.get("policy_number"),
-        "policy_type": state.get("policy_type"),
-        "start_date": state.get("start_date"),
-        "end_date": state.get("end_date"),
-    }
-    is_valid, messages = verify_policy(details)
-
-    if not is_valid:
-        fraud_email = draft_fraud_alert(details, messages)
-        send_summary_email(fraud_email["subject"], fraud_email["body"])
-        state["fraud"] = True
-        state["answer"] = "Policy details do not match our records."
-    else:
-        state["fraud"] = False
-    return state
-
-# --- Helper: Hallucination Check ---
+# --- Ground Truth Check ---
 def enforce_grounding(answer: str, docs: str) -> str:
-    """Use a lightweight LLM to check if the answer is supported by docs."""
     prompt = f"""
-    You are a strict judge.
+    You are a strict insurance assistant.
 
     Answer: {answer}
 
@@ -64,149 +30,261 @@ def enforce_grounding(answer: str, docs: str) -> str:
 
     Task:
     - If the answer is clearly supported by the document, reply: SUPPORTED
-    - If the answer is not found in the document, reply: NOT SUPPORTED
+    - If the answer is not supported or is uncertain, reply: NOT SUPPORTED
     """
-
-    verdict = call_llm(prompt, LLM_LIGHT_MODEL).strip().upper()
-    if "SUPPORTED" in verdict:
-        return answer
-
-    # fallback if unsupported
-    return "The asked information is not present in the provided policy document."
+    verdict = call_llm(prompt, LLM_LIGHT_MODEL)
+    return str(verdict).strip().upper()  # SUPPORTED / NOT SUPPORTED
 
 
-def health_agent(state: dict):
-    q = state["question"]
-    history = state.get("history", [])
+# --- Router (always start with RAG) ---
+def router(state: dict):
+    state["route"] = "RAG_AGENT"
+    print("[router] default route: RAG_AGENT")
+    return ensure_dict(state, "router")
 
-    history_text = "\n".join([
-        f"User: {h['user']}\nAssistant: {h['assistant']}"
-        for h in history[-5:]
-    ])
-
-    results = retrieve_query(q, VECTOR_COLLECTION)
-    docs = collect_docs(results)
-    doc_text = "\n".join(docs)
-
-    # Generate raw answer
+def rewrite_query(question: str, history: str) -> str:
+    """
+    Rewrite the user's latest question into a self-contained query
+    that can be understood without any prior conversation.
+    """
     prompt = f"""
-    You are a Health Insurance Agent.
+    Rewrite the user's latest question into a self-contained query
+    that can be understood without any prior conversation.
 
-    Answer the user’s question ONLY using the information in the provided policy document.
-    If the answer is not explicitly stated in the document, reply with your best guess.
-    (Your answer will be checked for grounding separately.)
+    Conversation History:
+    {history or "[No prior conversation]"}
 
-    Conversation so far:
-    {history_text}
+    Latest Question:
+    {question}
 
-    Current Question: {q}
-
-    Policy Document:
-    {doc_text}
+    Rewritten Query:
     """
-    raw_answer = call_llm(prompt).strip()
 
-    # ✅ Post-validation step
-    state["health_answer"] = enforce_grounding(raw_answer, doc_text)
-    return state
+    return str(call_llm(prompt, LLM_LIGHT_MODEL)).strip()
 
 
+def rag_agent(state: dict):
+    question = state.get("question", "").strip()
+    memory: HybridMemory = state.get("memory")
 
-def vehicle_agent(state: dict):
-    q = state["question"]
-    history = state.get("history", [])
+    # Load history
+    past = memory.load_memory_variables({}) if memory else {"history": ""}
+    history_text = past.get("history", "").strip()
 
-    history_text = "\n".join([
-        f"User: {h['user']}\nAssistant: {h['assistant']}"
-        for h in history[-5:]
-    ])
+    # Rewrite query
+    rewritten_query = rewrite_query(question, history_text)
+    print(f"[rag_agent] Original Q: {question}")
+    print(f"[rag_agent] Rewritten Q: {rewritten_query}")
 
-    results = retrieve_query(q, VECTOR_COLLECTION)
+    # Retrieve docs (just use clean query for retriever)
+    results = retrieve_query(rewritten_query, VECTOR_COLLECTION, top_k=5)
+
+    # Fallback: try raw question if no docs
+    if not results:
+        print("[rag_agent] ⚠️ No docs for rewritten query, retrying with raw question")
+        results = retrieve_query(question, VECTOR_COLLECTION, top_k=5)
+
     docs = collect_docs(results)
-    doc_text = "\n".join(docs)
+    doc_text = "\n".join(docs).strip()
 
-    # Generate raw answer
+    # Policy context only for answering
+    policy_context = ", ".join(filter(None, [
+        f"Policy Number: {state.get('policy_number')}" if state.get("policy_number") else None,
+        f"Type: {state.get('policy_type')}" if state.get("policy_type") else None,
+        f"Policyholder: {state.get('policyholder_name')}" if state.get("policyholder_name") else None
+    ])) or "[Not available]"
+
+    # Build answering prompt
     prompt = f"""
-    You are a Vehicle Insurance Agent.
+    You are an Insurance Agent.
 
-    Answer the user’s question ONLY using the information in the provided policy document.
-    If the answer is not explicitly stated in the document, reply with your best guess.
-    (Your answer will be checked for grounding separately.)
+    Answer naturally and conversationally, as if you are assisting a customer.
+    Use ONLY the information in the provided policy document.
+    If the document does not contain the answer, say so politely.
 
-    Conversation so far:
-    {history_text}
+    User Question: {question}
+    Rewritten Query: {rewritten_query}
+    Policy Context: {policy_context}
+    Conversation Context: {history_text}
 
-    Current Question: {q}
-
-    Policy Document:
-    {doc_text}
+    Retrieved Policy Chunks:
+    {doc_text or "[No documents retrieved]"}
     """
-    raw_answer = call_llm(prompt).strip()
 
-    # ✅ Post-validation step
-    state["vehicle_answer"] = enforce_grounding(raw_answer, doc_text)
-    return state
+    raw_answer = str(call_llm(prompt, LLM_LIGHT_MODEL)).strip()
+
+    # Grounding check
+    verdict = enforce_grounding(raw_answer, doc_text)
+    print(f"[rag_agent] VERDICT={verdict} | RAW={raw_answer[:120]}...")
+
+    if verdict == "SUPPORTED":
+        state["rag_answer"] = state["answer"] = raw_answer
+        print(f"[rag_agent] ✅ answered: {raw_answer[:80]}...")
+    else:
+        state["handoff"] = True
+        state["answer"] = "This question requires assistance from our support team."
+        print("[rag_agent] ⏩ escalation → HUMAN_AGENT")
+
+    if memory:
+        memory.save_context({"input": question}, {"output": state["answer"]})
+
+    return ensure_dict(state, "rag_agent")
+
 
 # --- Human Agent ---
 def human_agent(state: dict):
-    q = state["question"]
-    state["handoff"] = True
-    state["answer"] = f"⚠️ Request '{q}' requires human assistance."
-    return state
+    # Already handled in rag_agent
+    print(f"[human_agent] handoff triggered: {state.get('answer')}")
+    return ensure_dict(state, "human_agent")
 
+
+# --- End Detector (LLM, last 2–3 turns) ---
+def detect_conversation_end(state: dict) -> bool:
+    memory = state.get("memory")
+    past = memory.load_memory_variables({}) if memory else {"history": ""}
+    history_text = past.get("history", "").strip()
+
+    # Extract last 3 exchanges (≈6 lines: user + assistant pairs)
+    if history_text:
+        recent_lines = history_text.split("\n")[-6:]
+        recent_text = "\n".join(recent_lines)
+    else:
+        recent_text = "[No prior conversation available]"
+
+    user_message = state.get("question", "").strip()
+
+    prompt = f"""
+    Recent conversation:
+    {recent_text}
+
+    Latest user message: "{user_message}"
+
+    Task:
+    - Reply YES if the user clearly intends to end the conversation
+      (e.g., "thanks", "thank you, that's all", "bye", "no further questions", "done").
+    - Reply NO if they are asking another question or continuing the chat.
+    Respond with ONLY YES or NO.
+    """
+
+    verdict = call_llm(prompt, LLM_LIGHT_MODEL)
+    verdict_str = str(verdict).strip().upper()
+
+    return verdict_str == "YES"
 
 # --- Responder ---
 def responder(state: dict):
-    if state.get("fraud"):
-        return {"answer": state["answer"]}
-
-    answer = (
-        state.get("health_answer")
-        or state.get("vehicle_answer")
-        or state.get("answer")
-    )
+    answer = state.get("rag_answer") or state.get("answer")
     state["answer"] = answer or "No response available."
 
-    # Maintain memory
-    history = state.get("history", [])
-    if isinstance(history, list):
-        history.append({"user": state["question"], "assistant": state["answer"]})
-        state["history"] = history
+    memory = state.get("memory")
+    if not memory:
+        return state
 
+    # Load memory variables (formatted history from HybridMemory)
+    past = memory.load_memory_variables({})
+
+    history_text = past.get("history", "").strip()
+    if history_text:
+        print("[conversation history]\n" + history_text)
+    else:
+        print("[conversation history] No conversation available yet.") 
+
+    if detect_conversation_end(state):
+        state["end_conversation"] = True
+
+    print(f"[responder] final answer: {state['answer'][:80]}...")
+    return ensure_dict(state, "responder")
+
+
+# --- Summarizer ---
+def summarize_conversation(state: dict):
+    memory = state.get("memory")
+    if not memory:
+        return state
+
+    past = memory.load_memory_variables({})
+    history_text = past.get("history", "").strip() or "[No conversation history available]"
+
+    print(f"[summarizer] Conversation history:\n{history_text}")
+
+    prompt = f"""
+    You are an insurance assistant. Summarize the conversation faithfully.
+
+    Conversation:
+    {history_text}
+
+    Task:
+    1. First, provide a clear **summary of the conversation** in plain text.
+    2. Then add the following three sections:
+
+    ### Critical Information
+    - List only facts, definitions, coverage points, waiting periods, exclusions, or conditions explicitly discussed.
+    - If none were discussed, write: "No critical information discussed."
+
+    ### Resolution
+    - State if the user’s question(s) were answered, partially answered, not answered, or escalated.
+    - If the policy coverage/approval could not be determined, write that explicitly.
+    - If nothing was resolved, write: "No questions were resolved."
+
+    ### Action Items
+    - If the assistant escalated, write: "Await support team follow-up."
+    - If clarification or approval is required (e.g., surgery, treatment), write: "Support team must review."
+    - If everything was resolved, write: "No action required."
+
+    Rules:
+    - Do NOT invent information not present in the conversation.
+    - Output must always have: conversation summary + 3 sections in this exact order.
+    """
+
+    resp = call_llm(prompt, LLM_LIGHT_MODEL)
+    structured_summary = str(resp).strip()
+
+    subject = f"Insurance Conversation Summary – Policy {state.get('policy_number')}"
+    body = (
+        f"Hello {state.get('policyholder_name') or 'Policyholder'},\n\n"
+        f"Here’s a summary of your recent conversation:\n\n"
+        f"{structured_summary}\n\n"
+        f"---\n"
+        f"### Full Conversation Log (for reference)\n\n"
+        f"{history_text}\n\n"
+        "Best regards,\nYour Insurance Team"
+    )
+
+    send_email(subject, body)
+
+    print("[summarizer] ✅ Summary + conversation log email sent")
+    state["conversation_summary"] = structured_summary
     return state
+
 
 
 # --- Graph Assembly ---
 graph = StateGraph(dict)
 
 graph.add_node("router", router)
-graph.add_node("fraud_agent", fraud_agent)
-graph.add_node("health_agent", health_agent)
-graph.add_node("vehicle_agent", vehicle_agent)
+graph.add_node("rag_agent", rag_agent)
 graph.add_node("human_agent", human_agent)
 graph.add_node("responder", responder)
+graph.add_node("summarizer", summarize_conversation)
 
 graph.set_entry_point("router")
 
-# Router chooses domain agent
+# router always → rag_agent
+graph.add_edge("router", "rag_agent")
+
+# rag_agent → responder
+graph.add_edge("rag_agent", "responder")
+
+# human_agent (if escalated) → responder
+graph.add_edge("human_agent", "responder")
+
+# summarizer only if end_conversation=True
 graph.add_conditional_edges(
-    "router",
-    lambda s: s["route"],
-    {
-        "HEALTH_AGENT": "health_agent",
-        "VEHICLE_AGENT": "vehicle_agent",
-        "HUMAN_AGENT": "human_agent",
-    },
+    "responder",
+    lambda s: "summarizer" if s.get("end_conversation") else "end",
+    {"summarizer": "summarizer", "end": END},
 )
 
-# Fraud always runs
-graph.add_edge("router", "fraud_agent")
-
-# End flows at responder
-graph.add_edge("health_agent", "responder")
-graph.add_edge("vehicle_agent", "responder")
-graph.add_edge("human_agent", "responder")
-graph.add_edge("fraud_agent", "responder")
-graph.add_edge("responder", END)
+graph.add_edge("summarizer", END)
 
 conversation_chain = graph.compile()

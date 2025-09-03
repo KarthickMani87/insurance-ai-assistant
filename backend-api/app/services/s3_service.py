@@ -36,6 +36,7 @@ def list_files(prefix="uploads/"):
     contents = response.get("Contents", [])
     return [obj["Key"] for obj in contents]
 
+
 def delete_file(key: str):
     s3_client.delete_object(Bucket=config.S3_BUCKET, Key=key)
     return {"message": f"Deleted {key}"}

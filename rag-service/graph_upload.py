@@ -1,5 +1,5 @@
 from langgraph.graph import StateGraph, END
-from services.llm_service import llm
+from services.llm_service import pick_llm
 
 class UploadState(dict):
     pass
@@ -21,6 +21,7 @@ def upload_extractor(state: UploadState):
     """
     import json
     try:
+        llm = pick_llm()
         extracted = json.loads(llm.invoke(prompt))
         state.update(extracted)
     except Exception as e:

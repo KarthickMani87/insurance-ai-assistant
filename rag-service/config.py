@@ -12,6 +12,7 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 EMBED_MODEL = os.getenv("EMBED_MODEL", "mixedbread-ai/mxbai-embed-large-v1")
 EMBEDDINGS_URL = os.getenv("EMBEDDINGS_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "none")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 KNN_SEARCH = int(os.getenv("KNN_SEARCH", 10))
 
 LLM_LIGHT_MODEL= os.getenv("LLM_LIGHT_MODEL", "gemma:2b")

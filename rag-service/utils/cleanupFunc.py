@@ -34,15 +34,34 @@ def normalize_date(date_str: Optional[str]) -> Optional[str]:
         return None
 
 
-def collect_docs(results: dict) -> list[str]:
+def collect_docs(results, with_metadata=False):
     """
-    Flatten and deduplicate documents from a Chroma query response.
-    Handles both single-query and multi-query results.
+    Collect docs from retrieval results.
+    Supports both reranked list format and raw Chroma dict format.
     """
-    docs = []
-    if results and "documents" in results:
-        for doc_list in results["documents"]:   # one list per query
-            for chunk in doc_list:
-                if chunk not in docs:           # avoid duplicates
-                    docs.append(chunk)
-    return docs
+    if not results:
+        return []
+
+    collected = []
+
+    # Case 1: reranked list format
+    if isinstance(results, list) and results and isinstance(results[0], dict):
+        for r in results:
+            if with_metadata:
+                collected.append(r)
+            else:
+                collected.append(r.get("text", ""))
+        return collected
+
+    # Case 2: raw Chroma dict
+    if isinstance(results, dict) and "documents" in results:
+        docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+        for d, m in zip(docs, metas):
+            collected.append({"text": d, "metadata": m} if with_metadata else d)
+        return collected
+
+    print("[collect_docs] ⚠️ Unexpected results format:", type(results))
+    return []
+
+

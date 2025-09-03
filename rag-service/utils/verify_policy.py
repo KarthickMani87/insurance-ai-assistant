@@ -4,22 +4,25 @@ from utils.chroma_client import retrieve_get
 from config import VECTOR_POLICY_SEARCH_KEY
 
 
-def verify_policy(details: dict):
+def get_policy_from_db(details: dict):
     """
-    Verify extracted policy details against the Chroma DB.
-    details: dict extracted from LLM
+    Retrieve a policy record from Chroma DB.
+    Returns policy metadata dict if found, else None.
     """
-
-    errors = []
-
     policy_result = retrieve_get(details.get(VECTOR_POLICY_SEARCH_KEY))
 
     if not policy_result or not policy_result.get("metadatas"):
-        return False, ["❌ No policy found in database"]
+        return None
+    
+    return policy_result["metadatas"][0]
 
-    policy = policy_result["metadatas"][0]    
+def verify_policy(details: dict, policy: dict):
+    """
+    Compare extracted policy details against a given policy record.
+    Returns (is_valid: bool, messages: list).
+    """
+    errors = []
 
-    # Fields to compare: (field_name, label, normalize)
     fields_to_check = [
         ("policyholder_name", "Policyholder name", str.lower),
         ("policy_type", "Policy type", str.lower),
@@ -27,16 +30,19 @@ def verify_policy(details: dict):
         ("end_date", "End date", str),
     ]
 
-    # Run comparisons
     for field, label, normalizer in fields_to_check:
         expected = policy.get(field)
         found = details.get(field)
 
         if expected and found:
-            if normalizer(str(expected).strip()) != normalizer(str(found).strip()):
+            norm_expected = normalizer(str(expected).strip())
+            norm_found = normalizer(str(found).strip())
+
+            # ✅ allow partial matches in either direction
+            if norm_expected not in norm_found and norm_found not in norm_expected:
                 errors.append(f"❌ {label} mismatch (Expected: {expected}; Found: {found})")
 
-    # Final result
     if errors:
         return False, errors
     return True, ["✅ Policy verified successfully"]
+

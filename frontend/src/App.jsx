@@ -1,5 +1,6 @@
-import React, { useState } from "react";
+import React, { useState, useRef } from "react";
 import UploadBox from "./components/UploadBox";
+import FileManager from "./components/FileManager";
 import ExtractedInfoCard from "./components/ExtractedInfoCard";
 import EditableFields from "./components/EditableFields";
 import ChatAssistant from "./components/ChatAssistant";
@@ -13,54 +14,42 @@ function App() {
   const [error, setError] = useState(null);
   const [progress, setProgress] = useState({ chunksDone: 0, totalChunks: 0 });
 
+  const fileManagerRef = useRef(null); // ✅ refresh file list after upload
+
   const handleProcessed = async ({ filename, key }) => {
     setLoading(true);
     setError(null);
     setPolicyInfo(null);
     setProgress({ chunksDone: 0, totalChunks: 0 });
-  
+
     try {
-      let data = null;
-  
-      while (true) {   // 👈 keep polling until completion
+      while (true) {
         const res = await fetch("http://localhost:8000/upload", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ key }),
         });
-  
+
         if (!res.ok) throw new Error("Backend error");
-        data = await res.json();
-  
-        // ✅ Always update progress (including "complete")
-        if (["processing", "pending", "complete"].includes(data.status)) {
+        const data = await res.json();
+
+        if (["processing", "pending"].includes(data.status)) {
+          // ⏳ Still running → update progress
           setProgress({
             chunksDone: data.chunks_done || 0,
             totalChunks: data.total_chunks || 0,
           });
+        } else {
+          // ✅ Terminal states
+          if (data.status === "complete") {
+            setPolicyInfo(data);
+          } else {
+            // not_found / error / unexpected
+            setError(data.message || "⚠️ Unexpected error. Please contact support.");
+          }
+          break; // 🚀 Exit loop once terminal state reached
         }
 
-        if (data.status === "complete") {
-          setPolicyInfo(data);
-          break;
-        }
-  
-        if (data.status === "complete" && data.policy_number) {
-          setPolicyInfo(data);
-          break;
-        }
-  
-        if (data.error) {
-          setError(data.error);
-          break;
-        }
-  
-        if (data.status === "not_found") {
-          setError("❌ Document not found");
-          break;
-        }
-  
-        // Still processing → wait and retry
         await new Promise((resolve) => setTimeout(resolve, 2000));
       }
     } catch (err) {
@@ -68,14 +57,22 @@ function App() {
       setError("❌ Failed to extract policy details");
     } finally {
       setLoading(false);
+      if (fileManagerRef.current) {
+        fileManagerRef.current.fetchFiles(); // ✅ refresh file list
+      }
     }
   };
 
   return (
     <div className="max-w-3xl mx-auto p-6">
-      <h1 className="text-3xl font-bold mb-6 text-center">🛡️ Insurance Assistant</h1>
+      <h1 className="text-3xl font-bold mb-6 text-center">
+        🛡️ Insurance Assistant
+      </h1>
 
       <UploadBox onProcessed={handleProcessed} />
+
+      {/* ✅ File Manager Section */}
+      <FileManager ref={fileManagerRef} />
 
       {loading && (
         <div className="mt-4">
