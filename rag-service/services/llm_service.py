@@ -141,10 +141,14 @@ Extract the following fields from the policy text below:
 - end_date: End/expiry date of the policy or "Period of Insurance".
 - policy_issuer: The issuing office/branch/company details if listed.
 
-STRICT RULES:
-- Output ONLY valid JSON (no markdown, no code fences, no explanations, no comments).
-- Do NOT guess or assume values. If unclear, use null or [].
-- Dates must remain exactly as in the text (no reformatting, no invention).
+STRICT MERGE RULES:
+- If ANY chunk has a non-null value for a field, always keep that value in the final result.
+- For start_date and end_date: never output null if at least one chunk provides a value.
+- For lists (insured_person, coverage): merge across all chunks, deduplicate.
+- For scalars (policyholder_name, policy_number, insurance_provider, policy_type, policy_issuer):
+  * Prefer the most complete, non-null value.
+  * Never replace a valid value with null.
+- Final output must be ONE valid JSON object, no lists, no markdown, no comments.
 
 {format_instructions}
 
@@ -190,9 +194,17 @@ def extract_merged_policy_data(chunk_results: List[Dict], model: str = None) -> 
     Partial results:
     {chunk_results}
 
-    STRICT RULES:
-    - Output ONLY a single valid JSON object (no list, no array, no markdown, no comments).
-    - Do not guess or assume values. If unclear, use null or [].
+    STRICT MERGE RULES:
+    - If ANY chunk result has a non-null, non-empty value for a field, use that value in the final JSON.
+    - For start_date and end_date, always choose the non-null values if present. Do not output null if at least one chunk has them.
+    - For lists (insured_person, coverage), merge and deduplicate across all partial results.
+    - For scalar fields (policy_number, policyholder_name, insurance_provider, policy_type, policy_issuer), pick the longest non-null value if multiple exist.
+    - Never drop correct values in favor of null.
+    - For scalar fields (policyholder_name, policy_number, insurance_provider, policy_type, start_date, end_date, policy_issuer):
+      • If multiple values exist, pick the most complete (non-null, non-empty, longer string).
+      • If only one is non-null, use that.
+    - Do not output null if at least one valid value exists.
+    - Final output must be ONE valid JSON object only.
     """
 
     chain = (
@@ -212,7 +224,6 @@ def extract_merged_policy_data(chunk_results: List[Dict], model: str = None) -> 
     except Exception as e:
         print("❌ Merge failed:", e)
         return PolicyMetadata().dict()
-
 
 
 def draft_fraud_alert(details: dict, errors: list):

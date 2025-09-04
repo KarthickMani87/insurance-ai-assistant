@@ -87,39 +87,24 @@ OVERLAP = int(os.getenv("OVERLAP", 60))
 def tokenize_length(text: str) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False))
 
-# --- Section detection ---
-SECTION_KEYWORDS = [
-    "DEFINITIONS", "EXCLUSIONS", "COVERAGE", "WAITING PERIOD",
-    "BENEFITS", "CLAIMS", "TERMS AND CONDITIONS"
-]
-
-def detect_section(line: str, current_section: str) -> str:
-    upper_line = line.strip().upper()
-    for keyword in SECTION_KEYWORDS:
-        if keyword in upper_line:
-            return keyword
-    return current_section
-
 # --- Block Detection ---
 def detect_blocks(text: str):
-    """Split into semantic blocks and tag sections."""
+    """Split into semantic blocks without section tagging."""
     lines = text.split("\n")
     blocks, buffer = [], []
-    current_section = "GENERAL"
 
     def flush():
-        nonlocal buffer, current_section
+        nonlocal buffer
         if buffer:
-            blocks.append({"text": "\n".join(buffer).strip(), "section": current_section})
+            blocks.append({"text": "\n".join(buffer).strip()})
             buffer = []
 
     for line in lines:
-        current_section = detect_section(line, current_section)
         line_strip = line.strip()
 
         if "|" in line_strip or "\t" in line_strip:
             flush()
-            blocks.append({"text": f"[TABLE START]\n{line_strip}\n[TABLE END]", "section": current_section})
+            blocks.append({"text": f"[TABLE START]\n{line_strip}\n[TABLE END]"})
             continue
 
         if re.match(r"^(\*|-|•)\s+", line_strip) or re.match(r"^\d+\.\s+", line_strip):
@@ -141,7 +126,6 @@ def dynamic_chunk(text: str, max_tokens=MAX_TOKENS, overlap=OVERLAP):
 
     for block in blocks:
         block_text = block["text"]
-        block_section = block["section"]
         tokens = tokenizer.encode(block_text, add_special_tokens=False)
 
         if len(tokens) > max_tokens:
@@ -149,24 +133,24 @@ def dynamic_chunk(text: str, max_tokens=MAX_TOKENS, overlap=OVERLAP):
             for word in words:
                 word_tokens = tokenize_length(word)
                 if sub_tokens + word_tokens > max_tokens:
-                    raw_chunks.append({"text": " ".join(sub_chunk), "section": block_section})
+                    raw_chunks.append({"text": " ".join(sub_chunk)})
                     sub_chunk, sub_tokens = [word], word_tokens
                 else:
                     sub_chunk.append(word)
                     sub_tokens += word_tokens
             if sub_chunk:
-                raw_chunks.append({"text": " ".join(sub_chunk), "section": block_section})
+                raw_chunks.append({"text": " ".join(sub_chunk)})
             continue
 
         if buffer_tokens + len(tokens) <= max_tokens:
             buffer.append(block_text)
             buffer_tokens += len(tokens)
         else:
-            raw_chunks.append({"text": "\n\n".join(buffer), "section": block_section})
+            raw_chunks.append({"text": "\n\n".join(buffer)})
             buffer, buffer_tokens = [block_text], len(tokens)
 
     if buffer:
-        raw_chunks.append({"text": "\n\n".join(buffer), "section": block_section})
+        raw_chunks.append({"text": "\n\n".join(buffer)})
 
     final_chunks = []
     for i, chunk in enumerate(raw_chunks):
@@ -180,10 +164,7 @@ def dynamic_chunk(text: str, max_tokens=MAX_TOKENS, overlap=OVERLAP):
             tokens = overlap_tokens + tokens
             tokens = tokens[:max_tokens]
 
-        final_chunks.append({
-            "text": tokenizer.decode(tokens),
-            "section": chunk["section"]
-        })
+        final_chunks.append({"text": tokenizer.decode(tokens)})
 
     return final_chunks
 
@@ -221,11 +202,10 @@ def process_file(key: str):
             "text": chunk["text"],
             "metadata": {
                 "policy_number": os.path.splitext(os.path.basename(key))[0],
-                "chunk_type": "table" if "[TABLE START]" in chunk["text"] else "text",
-                "section": chunk["section"]
+                "chunk_type": "table" if "[TABLE START]" in chunk["text"] else "text"
             }
         }
-        print(f"📤 Publishing chunk {i+1}/{len(chunks)} for {key}, section={chunk['section']}")
+        print(f"📤 Publishing chunk {i+1}/{len(chunks)} for {key}")
         channel.basic_publish(
             exchange="",
             routing_key=QUEUE_NAME,

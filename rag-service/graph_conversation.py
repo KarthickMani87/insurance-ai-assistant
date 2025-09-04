@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from langgraph.graph import StateGraph, END
 from services.llm_service import call_llm
 from services.email_service import send_email
@@ -36,17 +37,57 @@ def enforce_grounding(answer: str, docs: str) -> str:
     return str(verdict).strip().upper()  # SUPPORTED / NOT SUPPORTED
 
 
-# --- Router (always start with RAG) ---
-def router(state: dict):
-    state["route"] = "RAG_AGENT"
-    print("[router] default route: RAG_AGENT")
-    return ensure_dict(state, "router")
+# --- Tools ---
+def check_policy_status(policy_number: str, start_date: str, end_date: str):
+    if not start_date or not end_date:
+        return {"status": "error", "message": "Missing policy dates for status check."}
 
+    today = datetime.today().date()
+    start = datetime.fromisoformat(start_date).date()
+    end = datetime.fromisoformat(end_date).date()
+
+    if today < start:
+        return {"status": "inactive", "message": f"Policy {policy_number} has not started yet (starts {start})."}
+    elif start <= today <= end:
+        return {"status": "active", "message": f"Policy {policy_number} is currently active (valid until {end})."}
+    else:
+        return {"status": "expired", "message": f"Policy {policy_number} expired on {end}."}
+
+
+def check_waiting_period(start_date: str, waiting_days: int = 30):
+    if not start_date:
+        return {"status": "error", "message": "Missing policy start date for waiting period check."}
+
+    today = datetime.today().date()
+    start = datetime.fromisoformat(start_date).date()
+    waiting_end = start + timedelta(days=waiting_days)
+
+    if today < start:
+        return {
+            "status": "not_started",
+            "message": f"Policy starts on {start}. Waiting period of {waiting_days} days applies after start date."
+        }
+    elif today < waiting_end:
+        remaining = (waiting_end - today).days
+        return {
+            "status": "waiting",
+            "message": f"Still in waiting period ({remaining} day(s) left). Claims not yet allowed."
+        }
+    else:
+        return {"status": "active", "message": "Waiting period has ended. Claims are now allowed."}
+
+
+def renew_policy(policy_number: str):
+    if not policy_number:
+        return {"status": "error", "message": "Missing policy number for renewal request."}
+
+    return {
+        "status": "renewal_requested",
+        "message": f"Renewal request for policy {policy_number} has been submitted. Our team will contact you."
+    }
+
+# --- Query Rewriting ---
 def rewrite_query(question: str, history: str) -> str:
-    """
-    Rewrite the user's latest question into a self-contained query
-    that can be understood without any prior conversation.
-    """
     prompt = f"""
     Rewrite the user's latest question into a self-contained query
     that can be understood without any prior conversation.
@@ -59,92 +100,139 @@ def rewrite_query(question: str, history: str) -> str:
 
     Rewritten Query:
     """
-
     return str(call_llm(prompt, LLM_LIGHT_MODEL)).strip()
 
 
+# --- RAG Agent ---
 def rag_agent(state: dict):
     question = state.get("question", "").strip()
     memory: HybridMemory = state.get("memory")
 
-    # Load history
     past = memory.load_memory_variables({}) if memory else {"history": ""}
     history_text = past.get("history", "").strip()
 
-    # Rewrite query
     rewritten_query = rewrite_query(question, history_text)
-    print(f"[rag_agent] Original Q: {question}")
-    print(f"[rag_agent] Rewritten Q: {rewritten_query}")
-
-    # Retrieve docs (just use clean query for retriever)
     results = retrieve_query(rewritten_query, VECTOR_COLLECTION, top_k=5)
-
-    # Fallback: try raw question if no docs
     if not results:
-        print("[rag_agent] ⚠️ No docs for rewritten query, retrying with raw question")
         results = retrieve_query(question, VECTOR_COLLECTION, top_k=5)
 
     docs = collect_docs(results)
     doc_text = "\n".join(docs).strip()
 
-    # Policy context only for answering
-    policy_context = ", ".join(filter(None, [
-        f"Policy Number: {state.get('policy_number')}" if state.get("policy_number") else None,
-        f"Type: {state.get('policy_type')}" if state.get("policy_type") else None,
-        f"Policyholder: {state.get('policyholder_name')}" if state.get("policyholder_name") else None
-    ])) or "[Not available]"
+    state["retrieved_docs"] = doc_text
+    state["rewritten_query"] = rewritten_query
+    state["history_text"] = history_text
 
-    # Build answering prompt
+    print(f"[rag_agent] Retrieved {len(docs)} docs")
+    return ensure_dict(state, "rag_agent")
+
+
+# --- Decision Agent ---
+def decision_agent(state: dict):
+    question = state.get("question", "").strip()
+    doc_text = state.get("retrieved_docs", "")
+    rewritten_query = state.get("rewritten_query", "")
+    history_text = state.get("history_text", "")
+
+    policy_number = state.get("policy_number")
+    start_date = state.get("start_date")
+    end_date = state.get("end_date")
+    waiting_days = state.get("waiting_period_days", 30)  # still optional
+    policyholder_name = state.get("policyholder_name")
+    insurance_provider = state.get("insurance_provider")
+    policy_type = state.get("policy_type")
+
+    # LLM decides if RAG or function
     prompt = f"""
-    You are an Insurance Agent.
-
-    Answer naturally and conversationally, as if you are assisting a customer.
-    Use ONLY the information in the provided policy document.
-    If the document does not contain the answer, say so politely.
-
     User Question: {question}
-    Rewritten Query: {rewritten_query}
-    Policy Context: {policy_context}
-    Conversation Context: {history_text}
 
-    Retrieved Policy Chunks:
-    {doc_text or "[No documents retrieved]"}
+    Policy Info:
+    - Policy Number: {policy_number}
+    - Policyholder: {policyholder_name}
+    - Insurance Provider: {insurance_provider}
+    - Policy Type: {policy_type}
+    - Start Date: {start_date}
+    - End Date: {end_date}
+    - Waiting Period (days): {waiting_days}
+
+    Retrieved Docs:
+    {doc_text or "[No documents]"}
+
+    Decide:
+    - Reply "RAG" if the answer is in the documents.
+    - Reply "CHECK_STATUS" for active/expired checks.
+    - Reply "WAITING_PERIOD" for waiting period questions.
+    - Reply "RENEW_POLICY" for renewal requests.
+    Only reply with one of: RAG, CHECK_STATUS, WAITING_PERIOD, RENEW_POLICY
     """
+    decision = str(call_llm(prompt, LLM_LIGHT_MODEL)).strip().upper()
+    print(f"[decision_agent] decision={decision}")
 
-    raw_answer = str(call_llm(prompt, LLM_LIGHT_MODEL)).strip()
+    if decision == "CHECK_STATUS":
+        result = check_policy_status(policy_number, start_date, end_date)
+        state["answer"] = result["message"]
 
-    # Grounding check
-    verdict = enforce_grounding(raw_answer, doc_text)
-    print(f"[rag_agent] VERDICT={verdict} | RAW={raw_answer[:120]}...")
+    elif decision == "WAITING_PERIOD":
+        result = check_waiting_period(start_date, waiting_days)
+        state["answer"] = result["message"]
 
-    if verdict == "SUPPORTED":
-        state["rag_answer"] = state["answer"] = raw_answer
-        print(f"[rag_agent] ✅ answered: {raw_answer[:80]}...")
-    else:
-        state["handoff"] = True
-        state["answer"] = "This question requires assistance from our support team."
-        print("[rag_agent] ⏩ escalation → HUMAN_AGENT")
+    elif decision == "RENEW_POLICY":
+        result = renew_policy(policy_number)
+        state["answer"] = result["message"]
 
+    else:  # fallback to RAG
+        policy_context = ", ".join(filter(None, [
+            f"Policy Number: {policy_number}" if policy_number else None,
+            f"Policyholder: {policyholder_name}" if policyholder_name else None,
+            f"Insurance Provider: {insurance_provider}" if insurance_provider else None,
+            f"Type: {policy_type}" if policy_type else None,
+        ])) or "[Not available]"
+
+        rag_prompt = f"""
+        You are an Insurance Agent.
+
+        Answer conversationally, grounded in the retrieved docs.
+        If the docs do not contain the answer, say so politely.
+
+        User Question: {question}
+        Rewritten Query: {rewritten_query}
+        Policy Context: {policy_context}
+        Conversation Context: {history_text}
+
+        Retrieved Docs:
+        {doc_text or "[No documents retrieved]"}
+        """
+        raw_answer = str(call_llm(rag_prompt, LLM_LIGHT_MODEL)).strip()
+        verdict = enforce_grounding(raw_answer, doc_text)
+
+        if verdict == "SUPPORTED":
+            state["answer"] = raw_answer
+            state["rag_answer"] = raw_answer
+            print(f"[decision_agent] ✅ RAG answer: {raw_answer[:80]}...")
+        else:
+            state["handoff"] = True
+            state["answer"] = "This question requires support team assistance."
+            print("[decision_agent] ⏩ escalation")
+
+    memory: HybridMemory = state.get("memory")
     if memory:
         memory.save_context({"input": question}, {"output": state["answer"]})
 
-    return ensure_dict(state, "rag_agent")
+    return ensure_dict(state, "decision_agent")
 
 
 # --- Human Agent ---
 def human_agent(state: dict):
-    # Already handled in rag_agent
     print(f"[human_agent] handoff triggered: {state.get('answer')}")
     return ensure_dict(state, "human_agent")
 
 
-# --- End Detector (LLM, last 2–3 turns) ---
+# --- End Detector ---
 def detect_conversation_end(state: dict) -> bool:
     memory = state.get("memory")
     past = memory.load_memory_variables({}) if memory else {"history": ""}
     history_text = past.get("history", "").strip()
 
-    # Extract last 3 exchanges (≈6 lines: user + assistant pairs)
     if history_text:
         recent_lines = history_text.split("\n")[-6:]
         recent_text = "\n".join(recent_lines)
@@ -161,15 +249,11 @@ def detect_conversation_end(state: dict) -> bool:
 
     Task:
     - Reply YES if the user clearly intends to end the conversation
-      (e.g., "thanks", "thank you, that's all", "bye", "no further questions", "done").
-    - Reply NO if they are asking another question or continuing the chat.
-    Respond with ONLY YES or NO.
+    - Reply NO otherwise.
     """
-
     verdict = call_llm(prompt, LLM_LIGHT_MODEL)
-    verdict_str = str(verdict).strip().upper()
+    return str(verdict).strip().upper() == "YES"
 
-    return verdict_str == "YES"
 
 # --- Responder ---
 def responder(state: dict):
@@ -177,20 +261,14 @@ def responder(state: dict):
     state["answer"] = answer or "No response available."
 
     memory = state.get("memory")
-    if not memory:
-        return state
+    if memory:
+        past = memory.load_memory_variables({})
+        history_text = past.get("history", "").strip()
+        if history_text:
+            print("[conversation history]\n" + history_text)
 
-    # Load memory variables (formatted history from HybridMemory)
-    past = memory.load_memory_variables({})
-
-    history_text = past.get("history", "").strip()
-    if history_text:
-        print("[conversation history]\n" + history_text)
-    else:
-        print("[conversation history] No conversation available yet.") 
-
-    if detect_conversation_end(state):
-        state["end_conversation"] = True
+        if detect_conversation_end(state):
+            state["end_conversation"] = True
 
     print(f"[responder] final answer: {state['answer'][:80]}...")
     return ensure_dict(state, "responder")
@@ -200,10 +278,16 @@ def responder(state: dict):
 def summarize_conversation(state: dict):
     memory = state.get("memory")
     if not memory:
+        print("[summarizer] ❌ No memory object, skipping summarization")
         return state
 
     past = memory.load_memory_variables({})
-    history_text = past.get("history", "").strip() or "[No conversation history available]"
+    history_text = past.get("history", "").strip()
+
+    if not history_text:
+        print("[summarizer] ⚠️ No conversation history available, skipping summarization")
+        state["conversation_summary"] = "No conversation history available. Nothing to summarize."
+        return state
 
     print(f"[summarizer] Conversation history:\n{history_text}")
 
@@ -214,28 +298,18 @@ def summarize_conversation(state: dict):
     {history_text}
 
     Task:
-    1. First, provide a clear **summary of the conversation** in plain text.
-    2. Then add the following three sections:
+    1. Provide a summary in plain text.
+    2. Then add:
 
     ### Critical Information
-    - List only facts, definitions, coverage points, waiting periods, exclusions, or conditions explicitly discussed.
-    - If none were discussed, write: "No critical information discussed."
+    - List only facts explicitly discussed.
 
     ### Resolution
-    - State if the user’s question(s) were answered, partially answered, not answered, or escalated.
-    - If the policy coverage/approval could not be determined, write that explicitly.
-    - If nothing was resolved, write: "No questions were resolved."
+    - State if questions were answered, partially answered, not answered, or escalated.
 
     ### Action Items
-    - If the assistant escalated, write: "Await support team follow-up."
-    - If clarification or approval is required (e.g., surgery, treatment), write: "Support team must review."
-    - If everything was resolved, write: "No action required."
-
-    Rules:
-    - Do NOT invent information not present in the conversation.
-    - Output must always have: conversation summary + 3 sections in this exact order.
+    - Note next steps (e.g., "Await support team follow-up" or "No action required").
     """
-
     resp = call_llm(prompt, LLM_LIGHT_MODEL)
     structured_summary = str(resp).strip()
 
@@ -245,40 +319,39 @@ def summarize_conversation(state: dict):
         f"Here’s a summary of your recent conversation:\n\n"
         f"{structured_summary}\n\n"
         f"---\n"
-        f"### Full Conversation Log (for reference)\n\n"
+        f"### Full Conversation Log\n\n"
         f"{history_text}\n\n"
         "Best regards,\nYour Insurance Team"
     )
 
     send_email(subject, body)
-
     print("[summarizer] ✅ Summary + conversation log email sent")
+
     state["conversation_summary"] = structured_summary
     return state
-
 
 
 # --- Graph Assembly ---
 graph = StateGraph(dict)
 
-graph.add_node("router", router)
 graph.add_node("rag_agent", rag_agent)
+graph.add_node("decision_agent", decision_agent)
 graph.add_node("human_agent", human_agent)
 graph.add_node("responder", responder)
 graph.add_node("summarizer", summarize_conversation)
 
-graph.set_entry_point("router")
+graph.set_entry_point("rag_agent")
 
-# router always → rag_agent
-graph.add_edge("router", "rag_agent")
+# rag_agent → decision_agent
+graph.add_edge("rag_agent", "decision_agent")
 
-# rag_agent → responder
-graph.add_edge("rag_agent", "responder")
+# decision_agent → responder
+graph.add_edge("decision_agent", "responder")
 
-# human_agent (if escalated) → responder
+# human_agent → responder
 graph.add_edge("human_agent", "responder")
 
-# summarizer only if end_conversation=True
+# summarizer condition
 graph.add_conditional_edges(
     "responder",
     lambda s: "summarizer" if s.get("end_conversation") else "end",
