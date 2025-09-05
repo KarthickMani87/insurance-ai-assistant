@@ -183,6 +183,11 @@ def upload_doc(data: UploadRequest):
         **{f: final_extracted.get(f) for f in fields}
     }
     redis_inst.set(extracted_key, json.dumps(response))
+    
+    # 🔹 Save short-lived details by policy_number (30 minutes)
+    policy_cache_key = f"policy:{final_extracted['policy_number']}"
+    redis_inst.setex(policy_cache_key, 1800, json.dumps(response))
+
     return response
 
 
@@ -210,15 +215,21 @@ def query(data: QueryRequest):
     stored_state["memory"] = memory
 
     # --- Prepare state for graph ---
+    policy_cache_key = f"policy:{data.policy_number}"
+    extracted = {}
+    if redis_inst.exists(policy_cache_key):
+        extracted = json.loads(redis_inst.get(policy_cache_key))
+
+    # --- Prepare state for graph ---
     default_state = {
         "policy_number": data.policy_number,
-        "policyholder_name": stored_state.get("policyholder_name"),
-        "insurance_provider": stored_state.get("insurance_provider"),
-        "policy_type": stored_state.get("policy_type"),
-        "start_date": data.start_date or stored_state.get("start_date"),
-        "end_date": data.end_date or stored_state.get("end_date"),
+        "policyholder_name": extracted.get("policyholder_name") or stored_state.get("policyholder_name"),
+        "insurance_provider": extracted.get("insurance_provider") or stored_state.get("insurance_provider"),
+        "policy_type": extracted.get("policy_type") or stored_state.get("policy_type"),
+        "start_date": data.start_date or extracted.get("start_date") or stored_state.get("start_date"),
+        "end_date": data.end_date or extracted.get("end_date") or stored_state.get("end_date"),
         "fraud": stored_state.get("fraud", False),
-        "memory": stored_state["memory"],  # HybridMemory object
+        "memory": stored_state["memory"],
         "question": data.question,
     }
 
@@ -247,4 +258,3 @@ def query(data: QueryRequest):
 
     # --- Only return the final RAG answer ---
     return {"answer": new_state.get("answer", "No response available.")}
-

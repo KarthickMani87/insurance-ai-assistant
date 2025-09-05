@@ -119,6 +119,9 @@ def rag_agent(state: dict):
     docs = collect_docs(results)
     doc_text = "\n".join(docs).strip()
 
+
+    print(f"Retrieved Document {doc_text}")
+
     state["retrieved_docs"] = doc_text
     state["rewritten_query"] = rewritten_query
     state["history_text"] = history_text
@@ -142,6 +145,7 @@ def decision_agent(state: dict):
     insurance_provider = state.get("insurance_provider")
     policy_type = state.get("policy_type")
 
+    print(f"Policy INFO {start_date} end date : {end_date}")
     # LLM decides if RAG or function
     prompt = f"""
     User Question: {question}
